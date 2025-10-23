@@ -62,7 +62,6 @@ htmlcov/
 docs/_build/
 
 # Local data / artifacts (change if you want to keep)
-data/
 snapshots/
 *.csv
 *.json
