@@ -29,6 +29,11 @@ Real-time pose guidance and alignment tools for OptiTrack — probe, park and sn
 - Save target poses, take per-snapshot JSON files and a run-scoped snapshot CSV.
 - Visual arrow preview showing the delta vector to the saved target.
 
+### Simulation of NatNet data
+
+![Simulator screenshot](data/images/markers_simulation.gif)
+
+
 ## Configuration
 
 - NatNet server / local IP and rigid-body names are configured at the top of `src/tracker.py`.

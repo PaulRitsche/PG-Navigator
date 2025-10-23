@@ -86,3 +86,4 @@ coverage/
 # Snapshots and data folders
 src/snapshots/
 src/__pycache__/
+notes.md
