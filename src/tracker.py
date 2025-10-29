@@ -5,6 +5,7 @@ import math
 import time
 from pathlib import Path
 from typing import Dict, Optional, Callable
+import logging
 
 import numpy as np
 from natnet import NatNetClient, DataDescriptions, DataFrame
@@ -19,9 +20,6 @@ RB_SUBJ = "Participant"
 GRID_LOCAL_POINT = np.array([0.0, 0.0, 0.0])
 SUBJ_BONE_TIP    = np.array([0.0, 0.0, 0.0])
 
-GRID_LOCAL_NORMAL = np.array([0.0, 0.0, 1.0])
-SUBJ_BONE_AXIS    = np.array([1.0, 0.0, 0.0])
-
 # Tolerances drive the "OK / Adjust" status in the UI
 TRANS_TOL_MM = 5.0
 ROT_TOL_DEG  = 5.0
@@ -35,16 +33,19 @@ SNAP_CSV  = Path("snapshots.csv")
 SNAP_JSON_DIR = Path("snapshots")
 SNAP_JSON_DIR.mkdir(exist_ok=True)
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 # ========= END CONFIG =========
 
 # ---------- math helpers ----------
-def quat_to_rot(qx, qy, qz, qw):
-    x, y, z, w = qx, qy, qz, qw
-    return np.array([
-        [1 - 2*(y*y + z*z), 2*(x*y - z*w),     2*(x*z + y*w)],
-        [2*(x*y + z*w),     1 - 2*(x*x + z*z), 2*(y*z - x*w)],
-        [2*(x*z - y*w),     2*(y*z + x*w),     1 - 2*(x*x + y*y)]
-    ], dtype=float)
+# def quat_to_rot(qx, qy, qz, qw):
+#     x, y, z, w = qx, qy, qz, qw
+#     return np.array([
+#         [1 - 2*(y*y + z*z), 2*(x*y - z*w),     2*(x*z + y*w)],
+#         [2*(x*y + z*w),     1 - 2*(x*x + z*z), 2*(y*z - x*w)],
+#         [2*(x*z - y*w),     2*(y*z + x*w),     1 - 2*(x*x + y*y)]
+#     ], dtype=float)
 
 def rotmat_from_quat(q):
     qx, qy, qz, qw = q
@@ -57,6 +58,14 @@ def rotmat_from_quat(q):
 def relative_RT(R_s, p_s, R_g, p_g):
     R_rel = R_s.T @ R_g
     t_rel = R_s.T @ (p_g - p_s)
+    return R_rel, t_rel
+
+def relative_RT_with_points(R_s, p_s, p_s_local, R_g, p_g, p_g_local):
+    # world points anchored at chosen local points
+    ps_star = p_s + R_s @ p_s_local.reshape(3)
+    pg_star = p_g + R_g @ p_g_local.reshape(3)
+    R_rel = R_s.T @ R_g
+    t_rel = R_s.T @ (pg_star - ps_star)
     return R_rel, t_rel
 
 def rotation_geodesic_deg(R_a, R_b):
@@ -162,7 +171,13 @@ def save_pose(path: Path, rb_states: Dict[str, dict]):
         return
     Rg = rotmat_from_quat(g["quat"]); pg = g["pos"]
     Rs = rotmat_from_quat(s["quat"]); ps = s["pos"]
-    R_rel, t_rel = relative_RT(Rs, ps, Rg, pg)
+    # R_rel, t_rel = relative_RT(Rs, ps, Rg, pg)
+
+    R_rel, t_rel = relative_RT_with_points(
+        Rs, ps, SUBJ_BONE_TIP,
+        Rg, pg, GRID_LOCAL_POINT
+    )
+
     data = {
         "target_rel": {"R_rel": R_rel.tolist(), "t_rel": t_rel.tolist()},
         "abs": {
@@ -182,7 +197,13 @@ def load_pose(path: Path):
         g = data[RB_GRID]; s = data[RB_SUBJ]
         Rg = rotmat_from_quat(np.array(g["quat"], float)); pg = np.array(g["pos"], float)
         Rs = rotmat_from_quat(np.array(s["quat"], float)); ps = np.array(s["pos"], float)
-        R_rel, t_rel = relative_RT(Rs, ps, Rg, pg)
+        # R_rel, t_rel = relative_RT(Rs, ps, Rg, pg)
+
+        R_rel, t_rel = relative_RT_with_points(
+            Rs, ps, SUBJ_BONE_TIP,
+            Rg, pg, GRID_LOCAL_POINT
+        )
+
         return {"target_rel": {"R_rel": R_rel.tolist(), "t_rel": t_rel.tolist()}, "abs": {RB_GRID: g, RB_SUBJ: s}}
     except Exception:
         return None
@@ -290,7 +311,14 @@ def run_tracker(on_update: Optional[Callable[[dict], None]] = None,
                     s = rb_states[RB_SUBJ]
                     Rg = rotmat_from_quat(g["quat"]); pg = g["pos"]
                     Rs = rotmat_from_quat(s["quat"]); ps = s["pos"]
-                    R_rel, t_rel = relative_RT(Rs, ps, Rg, pg)
+                    # R_rel, t_rel = relative_RT(Rs, ps, Rg, pg)
+
+                    
+                    R_rel, t_rel = relative_RT_with_points(
+                        Rs, ps, SUBJ_BONE_TIP,
+                        Rg, pg, GRID_LOCAL_POINT
+                    )
+
 
                     # UI requests
                     if control.pop_save():
@@ -389,7 +417,7 @@ def run_tracker(on_update: Optional[Callable[[dict], None]] = None,
                         # Direction vector to move Grid in the Subject frame (mm)
                         # Move by (t_rel_0 - t_rel) to reach the target:
                         delta_vec_mm = (t_rel_0 - t_rel) * 1000.0
-                        delta_vec_mm *= -1.0   
+                        # delta_vec_mm *= -1.0   
                         dx, dy, dz = [float(x) for x in delta_vec_mm]
 
 
