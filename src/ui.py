@@ -8,6 +8,7 @@ from datetime import datetime
 import json
 import logging
 import tracker  # tracker.py alongside
+import numpy as np
 
 
 # TODO Handle loading/saving target poses in UI 
@@ -78,6 +79,155 @@ class Card(QtWidgets.QFrame):
         lay.addWidget(self.title)
         self.value = big_value("—")
         lay.addWidget(self.value)
+
+class GLIndicators:
+    """
+    Top-view scene overlays:
+      - Crosshair centered at origin (reference point)
+      - Semi-transparent cone showing translation+tilt (subject frame)
+      - Dotted axis along the cone
+      - Rotation dial (circle) with floating point at rotation_error angle (magnitude)
+    """
+    def __init__(self, parent_view: gl.GLViewWidget):
+        self.view = parent_view
+
+        # --- Scene / camera: TOP-DOWN (look down +Z) ---
+        self.view.setBackgroundColor(QtGui.QColor(12, 18, 36))
+        self.view.opts['distance']   = 260
+        self.view.opts['elevation']  = 90   # top view
+        self.view.opts['azimuth']    = 0
+        self.view.opts['fov']        = 40
+
+        # --- Ground grid for orientation (optional, faint) ---
+        grid = gl.GLGridItem(glOptions='additive')
+        grid.setSize(220, 220, 0)
+        grid.setSpacing(10, 10, 10)
+        grid.setColor((255, 255, 255, 60))
+        grid.rotate(90, 1, 0, 0)  # lay it in XY plane (Z up)
+        self.view.addItem(grid)
+
+        # Crosshair (X and Y axes on Z=0)
+        self.cross_x = gl.GLLinePlotItem()
+        self.cross_y = gl.GLLinePlotItem()
+        self._update_crosshair(length=200.0)
+
+        # Cone (semi-transparent) aligned with live vector (Z-up base) 
+        self.cone_md  = MeshData.cylinder(rows=16, cols=48, radius=[0.0, 1.0], length=1.0)  # unit cone along +Z
+        self.cone     = GLMeshItem(meshdata=self.cone_md, smooth=True, drawFaces=True, drawEdges=False, glOptions='additive')
+        self.cone.setColor((0.38, 0.64, 0.98, 0.28)) 
+        self.view.addItem(self.cone)
+
+        # Dotted axis along the cone (made from small points)
+        self.axis_points = gl.GLScatterPlotItem(size=4.0, pxMode=True)
+        self.axis_points.setGLOptions('additive')
+        self.axis_points.setData(pos=np.zeros((1,3)), color=(1,1,1,0.7))
+        self.view.addItem(self.axis_points)
+
+        # Rotation dial (circle in XY plane) + floating point marker 
+        self.dial_radius = 60.0
+        self.dial = gl.GLLinePlotItem(glOptions='additive')
+        circ_pts = self._circle_xy(self.dial_radius, n=180)
+        self.dial.setData(pos=circ_pts, color=(1,1,1,0.3), width=2)
+        self.view.addItem(self.dial)
+
+        self.rot_marker = gl.GLScatterPlotItem(size=8.0, pxMode=True)
+        self.rot_marker.setData(pos=np.array([[self.dial_radius, 0.0, 0.0]]), color=(0.95,0.75,0.2,1.0), size=2)
+        self.view.addItem(self.rot_marker)
+
+        # initialize with zero vector
+        self.set_translation_vec_mm((0.0, 0.0, 0.0))
+        self.set_rotation_deg(0.0)
+
+    # ---------- helpers ----------
+    def _update_crosshair(self, length=200.0):
+        # X axis line: from -L..+L on X, Y=0, Z=0
+        xs = np.array([[-length, 0.0, 0.0], [length, 0.0, 0.0]], dtype=float)
+        ys = np.array([[0.0, -length, 0.0], [0.0, length, 0.0]], dtype=float)
+        self.cross_x.setData(pos=xs, color=(1,1,1,0.6), width=2)
+        self.cross_y.setData(pos=ys, color=(1,1,1,0.6), width=2)
+        self.view.addItem(self.cross_x)
+        self.view.addItem(self.cross_y)
+
+    @staticmethod
+    def _unit_and_len(vec):
+        x,y,z = vec
+        L = math.sqrt(x*x + y*y + z*z)
+        if L < 1e-6:
+            return (0.0,0.0,1.0), 0.0
+        return (x/L, y/L, z/L), L
+
+    @staticmethod
+    def _axis_angle_from_z(u):
+        # rotate from +Z to unit vector u
+        ux, uy, uz = u
+        # axis = zhat × u
+        ax = 0.0*uz - 1.0*uy
+        ay = 1.0*ux - 0.0*uz
+        az = 0.0*uy - 0.0*ux
+        dot = max(-1.0, min(1.0, 1.0*uz + 0.0*uy + 0.0*ux))
+        ang_deg = math.degrees(math.acos(dot))
+        if abs(ax)+abs(ay)+abs(az) < 1e-6:
+            ax, ay, az = (1.0, 0.0, 0.0)
+        return ang_deg, ax, ay, az
+
+    @staticmethod
+    def _circle_xy(radius, n=180, z=0.0):
+        th = np.linspace(0, 2*np.pi, n, endpoint=True)
+        x = radius*np.cos(th); y = radius*np.sin(th)
+        z = np.full_like(x, z)
+        return np.vstack([x,y,z]).T
+
+    def _set_cone_transform(self, vec_mm):
+        """
+        Place a unit cone at origin, scale it to the vector length, rotate it toward vec direction.
+        The cone base remains at origin; cone extends along the vector.
+        """
+        u, L = self._unit_and_len(vec_mm)
+
+        # Reset transform
+        self.cone.resetTransform()
+
+        # Scale: unit cone has length 1 along +Z and radius 1 at top → scale Z by L, XY by (L * opening)
+        # Opening: make radius proportional to length so "tilt" is visible. Use mild opening.
+        opening = 0.20  # radius at far end is opening*L
+        self.cone.scale(opening*L, opening*L, L)
+
+        # Move so cone base at origin (unit cone base is at z=0, tip at z=+1 → OK already)
+
+        # Rotate from +Z to direction
+        ang, ax, ay, az = self._axis_angle_from_z(u)
+        self.cone.rotate(ang, ax, ay, az)
+
+    def _set_dotted_axis(self, vec_mm, dots=20):
+        """
+        Scatter points along the vector to emulate a dotted axis inside the cone.
+        """
+        u, L = self._unit_and_len(vec_mm)
+        if L < 1e-6:
+            pts = np.zeros((1,3))
+        else:
+            t = np.linspace(0.0, L, dots)
+            pts = np.stack([u[0]*t, u[1]*t, u[2]*t], axis=1)
+        self.axis_points.setData(pos=pts, color=(1,1,1,0.7))
+
+    def set_translation_vec_mm(self, vec_mm):
+        """
+        vec_mm is the live delta (Subject frame) you already send to the view, after subject_to_view().
+        This updates: the cone transform and the dotted axis.
+        """
+        self._set_cone_transform(vec_mm)
+        self._set_dotted_axis(vec_mm)
+
+    def set_rotation_deg(self, angle_deg, signed=False):
+        """
+        Places a floating point on a top-view dial at 'angle_deg'.
+        NOTE: with current backend we receive magnitude only, so we plot at +angle.
+              If you later stream a signed angle, pass signed=True and a signed value.
+        """
+        a = math.radians(angle_deg if signed else abs(angle_deg))
+        x = self.dial_radius * math.cos(a)
+        y = self.dial_radius * math.sin(a)
+        self.rot_marker.setData(pos=np.array([[x, y, 0.0]]), color=(0.95,0.75,0.2,1.0), size = 15)
 
 class GLArrow:
     """
@@ -248,8 +398,10 @@ class TrackerUI(QtWidgets.QWidget):
 
 
         # --- 3D view (arrow only) ---
+        # self.view3d = gl.GLViewWidget()
+        # self.arrow = GLArrow(self.view3d)
         self.view3d = gl.GLViewWidget()
-        self.arrow = GLArrow(self.view3d)
+        self.ind = GLIndicators(self.view3d)
 
         view_wrap = QtWidgets.QFrame()
         view_wrap.setStyleSheet(f"QFrame {{ background-color: {CARD_BG}; border-radius: 16px; }}")
@@ -424,11 +576,28 @@ class TrackerUI(QtWidgets.QWidget):
             self._toast_timer.start(2000)
             return
 
+        # # live values
+        # t = float(data.get("translation_error_mm", 0))
+        # r = float(data.get("rotation_error_deg", 0))
+        # s = float(data.get("score", 0))
+        # vec = data.get("delta_vec_mm", [0.0,0.0,0.0])
+
+        # self.card_trans.value.setText(f"{t:.2f}")
+        # self.card_rot.value.setText(f"{r:.2f}")
+        # self.card_score.value.setText(f"{s:.2f}")
+
+        # ok = bool(data.get("within_tol", False))
+        # self.status_pill.setText("OK" if ok else "ADJUST")
+        # self.status_pill.setStyleSheet(PILL_OK_STYLE if ok else PILL_ADJ_STYLE)
+      
+        # # Update 3D arrow (direction & magnitude)
+        # self.arrow.set_vector_mm(subject_to_view(vec))
+
         # live values
-        t = float(data.get("translation_error_mm", 0))
-        r = float(data.get("rotation_error_deg", 0))
-        s = float(data.get("score", 0))
-        vec = data.get("delta_vec_mm", [0.0,0.0,0.0])
+        t = float(data.get("translation_error_mm", 0) or 0)
+        r = float(data.get("rotation_error_deg", 0) or 0)
+        s = float(data.get("score", 0) or 0)
+        vec = data.get("delta_vec_mm", [0.0, 0.0, 0.0])
 
         self.card_trans.value.setText(f"{t:.2f}")
         self.card_rot.value.setText(f"{r:.2f}")
@@ -437,9 +606,12 @@ class TrackerUI(QtWidgets.QWidget):
         ok = bool(data.get("within_tol", False))
         self.status_pill.setText("OK" if ok else "ADJUST")
         self.status_pill.setStyleSheet(PILL_OK_STYLE if ok else PILL_ADJ_STYLE)
-      
-        # Update 3D arrow (direction & magnitude)
-        self.arrow.set_vector_mm(subject_to_view(vec))
+
+        # Update visuals:
+        # 1) Translation+tilt cone (use your Subject→View mapping)
+        self.ind.set_translation_vec_mm(subject_to_view(vec))
+        # 2) Rotation dial (currently magnitude only)
+        self.ind.set_rotation_deg(r, signed=False)
     
     def _safe_thread_running(self):
         """Return True if thread exists and is alive; swallow deleted-object states."""

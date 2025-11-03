@@ -36,18 +36,9 @@ SNAP_JSON_DIR.mkdir(exist_ok=True)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ========= END CONFIG =========
+# Math helpers
 
-# ---------- math helpers ----------
-# def quat_to_rot(qx, qy, qz, qw):
-#     x, y, z, w = qx, qy, qz, qw
-#     return np.array([
-#         [1 - 2*(y*y + z*z), 2*(x*y - z*w),     2*(x*z + y*w)],
-#         [2*(x*y + z*w),     1 - 2*(x*x + z*z), 2*(y*z - x*w)],
-#         [2*(x*z - y*w),     2*(y*z + x*w),     1 - 2*(x*x + y*y)]
-#     ], dtype=float)
-
-def rotmat_from_quat(q):
+def rotmat_from_quat(q): # this is how the quarternion is defined in NatNet
     qx, qy, qz, qw = q
     return np.array([
         [1 - 2*(qy*qy + qz*qz), 2*(qx*qy - qz*qw),     2*(qx*qz + qy*qw)],
@@ -127,6 +118,7 @@ def parse_rb_states(df: DataFrame) -> Dict[str, dict]:
         return {}
 
     rb_items = []
+    # Extract rigid body data position and rotation (from quaternion)
     for rb in rb_list:
         rid = getattr(rb, "id_num", getattr(rb, "id", getattr(rb, "rigid_body_id", None)))
         pos = getattr(rb, "pos", None)
@@ -171,7 +163,6 @@ def save_pose(path: Path, rb_states: Dict[str, dict]):
         return
     Rg = rotmat_from_quat(g["quat"]); pg = g["pos"]
     Rs = rotmat_from_quat(s["quat"]); ps = s["pos"]
-    # R_rel, t_rel = relative_RT(Rs, ps, Rg, pg)
 
     R_rel, t_rel = relative_RT_with_points(
         Rs, ps, SUBJ_BONE_TIP,
@@ -195,9 +186,8 @@ def load_pose(path: Path):
         return data
     try:
         g = data[RB_GRID]; s = data[RB_SUBJ]
-        Rg = rotmat_from_quat(np.array(g["quat"], float)); pg = np.array(g["pos"], float)
+        Rg = rotmat_from_quat(np.array(g["quat"], float)); pg = np.array(g["pos"], float) # here we use quarternions, not euler angles and turn them into rotation matrices
         Rs = rotmat_from_quat(np.array(s["quat"], float)); ps = np.array(s["pos"], float)
-        # R_rel, t_rel = relative_RT(Rs, ps, Rg, pg)
 
         R_rel, t_rel = relative_RT_with_points(
             Rs, ps, SUBJ_BONE_TIP,
