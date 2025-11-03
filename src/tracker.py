@@ -38,6 +38,42 @@ logger = logging.getLogger(__name__)
 
 # Math helpers
 
+# --- NEW: quat helpers ---
+def q_normalize(q):
+    q = np.asarray(q, float)
+    n = np.linalg.norm(q)
+    if n == 0:
+        return np.array([0,0,0,1], float)
+    return q / n
+
+class QCont:
+    """Per-RB hemisphere continuity keeper."""
+    def __init__(self): self.prev = {}
+    def fix(self, name, q):
+        q = q_normalize(q)
+        if name in self.prev and np.dot(q, self.prev[name]) < 0:
+            q = -q
+        self.prev[name] = q
+        return q
+
+qcont = QCont()
+
+# --- OPTIONAL: basis transform (identity by default) ---
+def R_basis_transform(R, mode='identity'):
+    if mode == 'identity':
+        return R
+    if mode == 'flipZ':  # e.g., Z-forward <-> Z-back or RH<->LH mapping
+        S = np.diag([1,1,-1])
+        return S @ R @ S
+    if mode == 'swapXZ':
+        P = np.array([[0,0,1],[0,1,0],[1,0,0]])
+        return P @ R @ P.T
+    # add other mappings as needed
+    return R
+
+BASIS_MODE = 'Indentity'  # set to 'flipZ' (or another) if your UI needs it
+
+
 def rotmat_from_quat(q): # this is how the quarternion is defined in NatNet
     qx, qy, qz, qw = q
     return np.array([
@@ -151,7 +187,7 @@ def parse_rb_states(df: DataFrame) -> Dict[str, dict]:
             name = nearest_name
         if not name:
             name = f"RB_{rid}"
-        states[name] = {"pos": pos, "quat": quat, "valid": valid}
+        states[name] = {"pos": pos, "quat": q_normalize(quat), "valid": valid}
     return states
 
 # ---------- save/load target ----------
@@ -299,9 +335,17 @@ def run_tracker(on_update: Optional[Callable[[dict], None]] = None,
                 if ok:
                     g = rb_states[RB_GRID]
                     s = rb_states[RB_SUBJ]
-                    Rg = rotmat_from_quat(g["quat"]); pg = g["pos"]
-                    Rs = rotmat_from_quat(s["quat"]); ps = s["pos"]
-                    # R_rel, t_rel = relative_RT(Rs, ps, Rg, pg)
+
+                    qg = qcont.fix(RB_GRID, g["quat"])
+                    qs = qcont.fix(RB_SUBJ, s["quat"])
+
+                    Rg = R_basis_transform(rotmat_from_quat(qg), BASIS_MODE); pg = g["pos"]
+                    Rs = R_basis_transform(rotmat_from_quat(qs), BASIS_MODE); ps = s["pos"]
+
+                    # g = rb_states[RB_GRID]
+                    # s = rb_states[RB_SUBJ]
+                    # Rg = rotmat_from_quat(g["quat"]); pg = g["pos"]
+                    # Rs = rotmat_from_quat(s["quat"]); ps = s["pos"]
 
                     
                     R_rel, t_rel = relative_RT_with_points(

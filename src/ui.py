@@ -67,7 +67,7 @@ def pill(text, ok=True):
 def subject_to_view(vec_mm):
     """Convert a vector in Subject frame (Z up) to View frame (Y up)."""
     x, y, z = vec_mm
-    return (-x, -z, y)   # swap Y<->Z and invert new Z
+    return (-x, -z, -y)   # swap Y<->Z and invert new Z
 
 class Card(QtWidgets.QFrame):
     def __init__(self, title):
