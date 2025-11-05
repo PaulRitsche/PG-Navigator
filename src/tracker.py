@@ -19,6 +19,8 @@ RB_SUBJ = "Participant"
 
 GRID_LOCAL_POINT = np.array([0.0, 0.0, 0.0])
 SUBJ_BONE_TIP    = np.array([0.0, 0.0, 0.0])
+BASIS_MODE = 'Identity'  # set to 'flipZ' (or another) if your UI needs it
+
 
 # Tolerances drive the "OK / Adjust" status in the UI
 TRANS_TOL_MM = 5.0
@@ -58,7 +60,7 @@ class QCont:
 
 qcont = QCont()
 
-# --- OPTIONAL: basis transform (identity by default) ---
+# basis transform
 def R_basis_transform(R, mode='identity'):
     if mode == 'identity':
         return R
@@ -70,9 +72,6 @@ def R_basis_transform(R, mode='identity'):
         return P @ R @ P.T
     # add other mappings as needed
     return R
-
-BASIS_MODE = 'Indentity'  # set to 'flipZ' (or another) if your UI needs it
-
 
 def rotmat_from_quat(q): # this is how the quarternion is defined in NatNet
     qx, qy, qz, qw = q
@@ -338,6 +337,7 @@ def run_tracker(on_update: Optional[Callable[[dict], None]] = None,
 
                     qg = qcont.fix(RB_GRID, g["quat"])
                     qs = qcont.fix(RB_SUBJ, s["quat"])
+                    
 
                     Rg = R_basis_transform(rotmat_from_quat(qg), BASIS_MODE); pg = g["pos"]
                     Rs = R_basis_transform(rotmat_from_quat(qs), BASIS_MODE); ps = s["pos"]
