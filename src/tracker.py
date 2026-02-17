@@ -23,7 +23,7 @@ BASIS_MODE = 'Identity'  # set to 'flipZ' (or another) if your UI needs it
 
 
 # Tolerances drive the "OK / Adjust" status in the UI
-TRANS_TOL_MM = 5.0
+TRANS_TOL_MM = 10
 ROT_TOL_DEG  = 5.0
 
 PRINT_INTERVAL_S = 0.05
@@ -238,7 +238,11 @@ def _save_snapshot_row(timestamp_iso: str,
                        rot_err_deg: float,
                        score: Optional[float],
                        delta_vec_mm: list,
-                       within_tol: bool) -> Path:
+                       within_tol: bool,
+                       grid_pos_mm: Optional[list] = None,
+                       grid_quat: Optional[list] = None,
+                       subj_pos_mm: Optional[list] = None,
+                       subj_quat: Optional[list] = None) -> Path:
     """Append a CSV row and write a per-snapshot JSON file."""
     rec = {
         "timestamp": timestamp_iso,
@@ -246,10 +250,23 @@ def _save_snapshot_row(timestamp_iso: str,
         "rotation_error_deg": float(rot_err_deg),
         "score": (None if score is None else float(score)),
         "within_tol": within_tol,
+        "current_pos_mm": [float(delta_vec_mm[0]), 
+                                float(delta_vec_mm[1]), 
+                             float(delta_vec_mm[2])],
         "delta_vec_mm_x": float(delta_vec_mm[0]),
         "delta_vec_mm_y": float(delta_vec_mm[1]),
         "delta_vec_mm_z": float(delta_vec_mm[2]),
     }
+    
+    # Add absolute rigid body positions if available
+    if grid_pos_mm is not None:
+        rec["grid_pos_mm"] = [float(x) for x in grid_pos_mm]
+    if grid_quat is not None:
+        rec["grid_quat"] = [float(x) for x in grid_quat]
+    if subj_pos_mm is not None:
+        rec["subject_pos_mm"] = [float(x) for x in subj_pos_mm]
+    if subj_quat is not None:
+        rec["subject_quat"] = [float(x) for x in subj_quat]
     # CSV append (write header if new)
     need_header = not SNAP_CSV.exists()
     with SNAP_CSV.open("a", newline="") as f:
@@ -403,7 +420,11 @@ def run_tracker(on_update: Optional[Callable[[dict], None]] = None,
                                 rot_err_deg=float(rot_err),
                                 score=float(score),
                                 delta_vec_mm=d_vec_mm.tolist(),
-                                within_tol=within_tol
+                                within_tol=within_tol,
+                                grid_pos_mm=pg.tolist(),
+                                grid_quat=g["quat"].tolist(),
+                                subj_pos_mm=ps.tolist(),
+                                subj_quat=s["quat"].tolist()
                             )
 
                             # emit a report packet for the UI
@@ -455,7 +476,7 @@ def run_tracker(on_update: Optional[Callable[[dict], None]] = None,
                         dx, dy, dz = [float(x) for x in delta_vec_mm]
 
 
-                        if on_update and (now - last_emit) >= 0.05:
+                        if on_update and (now - last_emit) >= 0.25:
                             on_update({
                                 "translation_error_mm": round(trans_err_mm, 2),
                                 "rotation_error_deg": round(rot_err_deg, 2),

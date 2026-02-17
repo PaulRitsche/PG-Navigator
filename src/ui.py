@@ -358,6 +358,512 @@ class TrackerWorker(QtCore.QObject):
         finally:
             self.finished.emit()
 
+# ---- Abs error dialog helpers (PyQt5 + pyqtgraph) ----
+def _snapshot_label(d: dict, fallback_name: str = "") -> str:
+    ts = d.get("ts", "") or d.get("timestamp", "")
+    if ts:
+        return ts
+    return fallback_name or "snapshot"
+
+def _safe_read_snapshot_meta(json_path: str) -> dict:
+    """
+    Read snapshot JSON and return a small dict with:
+      - ts label
+      - json path
+      - extracted position (if possible)
+    Never throws; returns minimal info.
+    """
+    p = Path(json_path)
+    try:
+        d = json.loads(p.read_text(encoding="utf-8"))
+        pos = _extract_position_mm(d)  # uses your tolerant extractor
+        return {
+            "ts": _snapshot_label(d, p.name),
+            "json": str(p),
+            "pos_mm": pos.tolist(),
+        }
+    except Exception:
+        return {
+            "ts": p.name,
+            "json": str(p),
+            "pos_mm": None,
+        }
+
+def _scan_snapshot_folder(folder: str, pattern: str = "*.json") -> list:
+    """
+    Scan a folder recursively for snapshot JSONs.
+    Returns a list of history entries: {"ts":..., "json":..., "pos_mm":...}
+    """
+    folder = str(folder)
+    base = Path(folder)
+    out = []
+    for p in base.rglob(pattern):
+        out.append(_safe_read_snapshot_meta(str(p)))
+    # newest first if ts looks sortable; otherwise keep filesystem order
+    return out
+
+def _load_snapshot_like(obj_or_path):
+    """
+    Accepts:
+      - dict already loaded
+      - path to .json file
+    Returns dict.
+    """
+    if isinstance(obj_or_path, dict):
+        return obj_or_path
+    p = Path(obj_or_path)
+    if not p.exists():
+        raise FileNotFoundError(str(p))
+    return json.loads(p.read_text(encoding="utf-8"))
+
+def _extract_vec_and_rot(d: dict):
+    """
+    Extracts (delta_vec_mm, rotation_error_deg) from a snapshot-like dict.
+    Make tolerant here if your keys differ.
+    """
+    # vector
+    vec = d.get("delta_vec_mm", None)
+    if vec is None:
+        # fallback attempts
+        vec = d.get("delta_vec", d.get("delta_mm", d.get("vec_mm", [0.0, 0.0, 0.0])))
+    vec = np.array(vec, dtype=float).reshape(3,)
+
+    # rotation
+    rot = d.get("rotation_error_deg", None)
+    if rot is None:
+        rot = d.get("rot_error_deg", d.get("rotation_deg", 0.0))
+    rot = float(rot or 0.0)
+    return vec, rot
+
+def compute_abs_errors_vec_rot(ref: dict, other: dict):
+    """
+    Absolute errors in SAME coordinate system:
+      - component abs errors (mm)
+      - euclidean distance (mm)
+      - abs rotation error difference (deg)
+    """
+    v_ref, r_ref = _extract_vec_and_rot(ref)
+    v_oth, r_oth = _extract_vec_and_rot(other)
+
+    dv = v_oth - v_ref
+    abs_comp = np.abs(dv)
+    dist = float(np.linalg.norm(dv))
+    abs_rot = float(abs(r_oth - r_ref))
+
+    return {
+        "v_ref": v_ref, "v_oth": v_oth,
+        "abs_comp_mm": abs_comp,
+        "dist_mm": dist,
+        "rot_abs_deg": abs_rot,
+        "rot_ref_deg": r_ref,
+        "rot_oth_deg": r_oth,
+    }
+
+def _extract_position_mm(d: dict) -> np.ndarray:
+    """
+    Try to extract an absolute 3D position (mm) from snapshot-like dict.
+    Supported:
+      - current_pos_mm: [x,y,z]
+      - current_pose: {"pos_mm":[x,y,z]} or {"pos":[...]} or {"t_mm":[...]}
+      - target_pos_mm similarly
+    Fallback:
+      - uses delta_vec_mm as a pseudo-position (error-space endpoint)
+    """
+    # 1) direct absolute position
+    if "current_pos_mm" in d and d["current_pos_mm"] is not None:
+        return np.array(d["current_pos_mm"], dtype=float).reshape(3,)
+
+    # 2) nested pose forms
+    pose = d.get("current_pose", None)
+    if isinstance(pose, dict):
+        for k in ("pos_mm", "pos", "t_mm", "t"):
+            if k in pose and pose[k] is not None:
+                return np.array(pose[k], dtype=float).reshape(3,)
+
+    # 3) fallback to delta vector endpoint (NOT absolute, but still visualizable)
+    vec, _ = _extract_vec_and_rot(d)
+    return np.array(vec, dtype=float).reshape(3,)
+
+def _as_pos3(arr, fallback=(0.0, 0.0, 0.0)) -> np.ndarray:
+        """Return (1,3) float32 finite array suitable for GLScatterPlotItem."""
+        try:
+            a = np.asarray(arr, dtype=np.float32).reshape(-1)
+            if a.size < 3:
+                a = np.array(fallback, dtype=np.float32)
+            else:
+                a = a[:3]
+        except Exception:
+            a = np.array(fallback, dtype=np.float32)
+
+        # sanitize NaN/Inf
+        if not np.all(np.isfinite(a)):
+            a = np.array(fallback, dtype=np.float32)
+
+        return a.reshape(1, 3)
+
+def _as_path_pts(pts_list, fallback_a, fallback_b) -> np.ndarray:
+    """Return (N,3) float32 finite path array."""
+    clean = []
+    for p in pts_list:
+        try:
+            a = np.asarray(p, dtype=np.float32).reshape(-1)[:3]
+            if a.size == 3 and np.all(np.isfinite(a)):
+                clean.append(a)
+        except Exception:
+            pass
+
+    if len(clean) == 0:
+        clean = [np.asarray(fallback_a, dtype=np.float32).reshape(-1)[:3],
+                np.asarray(fallback_b, dtype=np.float32).reshape(-1)[:3]]
+
+    return np.vstack(clean).astype(np.float32)
+
+class AbsErrorDialog(QtWidgets.QDialog):
+    """
+    Compare:
+      - Snapshot vs Snapshot (choose two from history)
+      - Live vs Snapshot (current live status vs chosen snapshot)
+    Shows bar plots + textual stats.
+    """
+    def __init__(self, parent, *, history, get_live_dict_callable):
+        super().__init__(parent)
+        self.setWindowTitle("Absolute Errors (same coordinate system)")
+        self.resize(900, 520)
+
+        self.history = history  # list of {"ts":..., "json":..., "csv":...}
+        self.get_live = get_live_dict_callable
+
+        root = QtWidgets.QVBoxLayout(self)
+
+        # --- selectors
+        row = QtWidgets.QHBoxLayout()
+        root.addLayout(row)
+
+        self.mode = QtWidgets.QComboBox()
+        self.mode.addItems(["Snapshot vs Snapshot", "Live vs Snapshot"])
+        row.addWidget(QtWidgets.QLabel("Mode:"))
+        row.addWidget(self.mode, 1)
+
+        self.btn_add_folder = QtWidgets.QPushButton("Add folder…")
+        self.btn_add_files  = QtWidgets.QPushButton("Add files…")
+        row.addWidget(self.btn_add_folder)
+        row.addWidget(self.btn_add_files)
+
+
+        self.cmb_a = QtWidgets.QComboBox()
+        self.cmb_b = QtWidgets.QComboBox()
+        row.addWidget(QtWidgets.QLabel("A (ref):"))
+        row.addWidget(self.cmb_a, 2)
+        row.addWidget(QtWidgets.QLabel("B (other):"))
+        row.addWidget(self.cmb_b, 2)
+
+        self.btn_compute = QtWidgets.QPushButton("Compute")
+        row.addWidget(self.btn_compute)
+
+        # --- plots + 3D + stats
+        mid = QtWidgets.QHBoxLayout()
+        root.addLayout(mid, 1)
+
+        # LEFT: 3D scene
+        self.view3d = gl.GLViewWidget()
+        self.view3d.setBackgroundColor(QtGui.QColor(17, 24, 39))  # similar to CARD_BG
+        self.view3d.opts["distance"] = 400
+        self.view3d.opts["elevation"] = 18
+        self.view3d.opts["azimuth"] = 45
+
+        # optional grid/axis
+        grid = gl.GLGridItem(glOptions="additive")
+        grid.setSize(400, 400, 0)
+        grid.setSpacing(20, 20, 20)
+        grid.setColor((255, 255, 255, 60))
+        grid.rotate(90, 1, 0, 0)  # put in XY plane
+        self.view3d.addItem(grid)
+
+        axis = gl.GLAxisItem()
+        axis.setSize(120, 120, 120)
+        self.view3d.addItem(axis)
+
+        # 3D objects: points and paths
+        self.pt_ref = gl.GLScatterPlotItem(size=10, pxMode=True)
+        self.pt_oth = gl.GLScatterPlotItem(size=10, pxMode=True)
+        self.pt_path = gl.GLLinePlotItem(glOptions="additive", width=2)
+
+        # ref->other vector
+        self.vec_line = gl.GLLinePlotItem(glOptions="additive", width=3)
+
+        self.view3d.addItem(self.pt_path)
+        self.view3d.addItem(self.vec_line)
+        self.view3d.addItem(self.pt_ref)
+        self.view3d.addItem(self.pt_oth)
+
+        # wrap 3D in a frame for style consistency
+        view_wrap = QtWidgets.QFrame()
+        view_wrap.setStyleSheet(f"QFrame {{ background-color: {CARD_BG}; border-radius: 12px; }}")
+        vlay = QtWidgets.QVBoxLayout(view_wrap)
+        vcap = QtWidgets.QLabel("3D pose/path view (mm)")
+        vcap.setStyleSheet(f"color:{TEXT_DIM}; padding:6px;")
+        vlay.addWidget(vcap)
+        vlay.addWidget(self.view3d, 1)
+
+        mid.addWidget(view_wrap, 2)
+
+        # MIDDLE: bar plots (same as before)
+        plots_col = QtWidgets.QVBoxLayout()
+        mid.addLayout(plots_col, 2)
+
+        self.plot_vec = pg.PlotWidget()
+        self.plot_vec.setBackground(CARD_BG)
+        self.plot_vec.showGrid(x=True, y=True, alpha=0.2)
+        self.plot_vec.setTitle("Abs component errors |Δx| |Δy| |Δz| (mm)", color=TEXT_MAIN)
+
+        self.plot_rot = pg.PlotWidget()
+        self.plot_rot.setBackground(CARD_BG)
+        self.plot_rot.showGrid(x=True, y=True, alpha=0.2)
+        self.plot_rot.setTitle("Abs rotation error |Δrot| (deg)", color=TEXT_MAIN)
+
+        plots_col.addWidget(self.plot_vec, 2)
+        plots_col.addWidget(self.plot_rot, 1)
+
+        # RIGHT: stats
+        self.txt = QtWidgets.QPlainTextEdit()
+        self.txt.setReadOnly(True)
+        self.txt.setStyleSheet(f"background-color:{CARD_BG}; color:{TEXT_MAIN}; border-radius:8px; padding:8px;")
+        mid.addWidget(self.txt, 2)
+
+        # populate combos
+        self._refresh_history()
+
+        self.mode.currentIndexChanged.connect(self._on_mode_changed)
+        self.btn_compute.clicked.connect(self._on_compute)
+        self.btn_add_folder.clicked.connect(self._on_add_folder)
+        self.btn_add_files.clicked.connect(self._on_add_files)
+
+
+        self._on_mode_changed()
+
+    def _refresh_history(self):
+        """
+        Populate combos from self.history (which may include runtime snapshots + imported ones).
+        De-duplicate by json path.
+        """
+        # de-dup by json path
+        seen = set()
+        new_hist = []
+        for h in self.history:
+            jp = h.get("json")
+            if not jp:
+                continue
+            jp = str(Path(jp))
+            if jp in seen:
+                continue
+            seen.add(jp)
+            new_hist.append(h)
+        self.history = new_hist
+
+        # fill combos
+        self.cmb_a.clear()
+        self.cmb_b.clear()
+        for h in self.history:
+            jp = Path(h.get("json", ""))
+            label = f"{h.get('ts', jp.name)}  —  {jp.parent.name}/{jp.name}"
+            self.cmb_a.addItem(label, userData=h)
+            self.cmb_b.addItem(label, userData=h)
+
+        if self.cmb_a.count() > 0 and self.cmb_a.currentIndex() < 0:
+            self.cmb_a.setCurrentIndex(0)
+        if self.cmb_b.count() > 1:
+            self.cmb_b.setCurrentIndex(self.cmb_b.count() - 1)
+        elif self.cmb_b.count() == 1:
+            self.cmb_b.setCurrentIndex(0)
+
+    def _on_add_folder(self):
+        folder = QtWidgets.QFileDialog.getExistingDirectory(self, "Select folder with snapshot JSONs")
+        if not folder:
+            return
+
+        added = _scan_snapshot_folder(folder, pattern="*.json")
+        if not added:
+            QtWidgets.QMessageBox.information(self, "No snapshots found", "No .json files found in that folder.")
+            return
+
+        self.history.extend(added)
+        self._refresh_history()
+        QtWidgets.QMessageBox.information(self, "Snapshots added", f"Added {len(added)} snapshot JSON files.")
+
+    def _on_add_files(self):
+        paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
+            self, "Select snapshot JSON files", "", "Snapshot JSON (*.json)"
+        )
+        if not paths:
+            return
+
+        added = [_safe_read_snapshot_meta(p) for p in paths]
+        self.history.extend(added)
+        self._refresh_history()
+        QtWidgets.QMessageBox.information(self, "Snapshots added", f"Added {len(added)} snapshot JSON files.")
+
+
+    def _on_mode_changed(self):
+        m = self.mode.currentText()
+        if m == "Live vs Snapshot":
+            self.cmb_a.setEnabled(False)  # A is live
+            self.cmb_a.setToolTip("A is LIVE in this mode")
+        else:
+            self.cmb_a.setEnabled(True)
+            self.cmb_a.setToolTip("")
+
+    def _barplot_vec(self, abs_comp_mm):
+        self.plot_vec.clear()
+        # 3 bars at x=0,1,2
+        x = np.array([0, 1, 2], dtype=float)
+        y = np.array(abs_comp_mm, dtype=float)
+        bg = pg.BarGraphItem(x=x, height=y, width=0.6, brush=pg.mkBrush(96, 165, 250, 190))
+        self.plot_vec.addItem(bg)
+        ax = self.plot_vec.getAxis("bottom")
+        ax.setTicks([[(0, "x"), (1, "y"), (2, "z")]])
+        self.plot_vec.setLabel("left", "mm")
+
+    def _barplot_rot(self, rot_abs_deg):
+        self.plot_rot.clear()
+        x = np.array([0], dtype=float)
+        y = np.array([rot_abs_deg], dtype=float)
+        bg = pg.BarGraphItem(x=x, height=y, width=0.6, brush=pg.mkBrush(245, 158, 11, 200))
+        self.plot_rot.addItem(bg)
+        ax = self.plot_rot.getAxis("bottom")
+        ax.setTicks([[(0, "Δrot")]])
+        self.plot_rot.setLabel("left", "deg")
+
+    def _on_compute(self):
+        try:
+            mode = self.mode.currentText()
+
+            # ---- ALWAYS define these first ----
+            ref_dict = None
+            oth_dict = None
+            a_label = ""
+            b_label = ""
+
+            if mode == "Live vs Snapshot":
+                # A = snapshot (ref), B = live
+                live = self.get_live()
+                if not isinstance(live, dict):
+                    raise ValueError("Live provider did not return a dict.")
+
+                b = self.cmb_b.currentData()
+                if not b or not b.get("json"):
+                    raise ValueError("Pick a snapshot (B).")
+
+                ref_dict = _load_snapshot_like(b["json"])
+                oth_dict = live
+
+                a_label = "SNAPSHOT (ref)"
+                b_label = "LIVE (other)"
+
+            else:  # Snapshot vs Snapshot
+                a = self.cmb_a.currentData()
+                b = self.cmb_b.currentData()
+
+                if not a or not b or not a.get("json") or not b.get("json"):
+                    raise ValueError("Pick two snapshots.")
+
+                ref_dict = _load_snapshot_like(a["json"])
+                oth_dict = _load_snapshot_like(b["json"])
+
+                a_label = "A (ref)"
+                b_label = "B (other)"
+
+            # ---- COMPUTE ----
+            res = compute_abs_errors_vec_rot(ref_dict, oth_dict)
+
+            # ---- RENDER ----
+            self._barplot_vec(res["abs_comp_mm"])
+            self._barplot_rot(res["rot_abs_deg"])
+            self._render_3d(ref_dict, oth_dict)
+
+            # ---- TEXT ----
+            self.txt.setPlainText(
+                f"{a_label} vec (mm): {res['v_ref'].tolist()}\n"
+                f"{b_label} vec (mm): {res['v_oth'].tolist()}\n\n"
+                f"Abs component errors (mm): {res['abs_comp_mm'].tolist()}\n"
+                f"Euclidean |Δvec| (mm): {res['dist_mm']:.4f}\n\n"
+                f"{a_label} rot (deg): {res['rot_ref_deg']:.4f}\n"
+                f"{b_label} rot (deg): {res['rot_oth_deg']:.4f}\n"
+                f"Abs |Δrot| (deg): {res['rot_abs_deg']:.4f}\n"
+            )
+
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Abs error failed", str(e))
+
+    def _render_3d(self, ref_dict: dict, oth_dict: dict):
+        """
+        Render:
+        - ref point and other point
+        - vector ref -> other
+        - path through snapshot history
+        """
+        # Extract positions (may fallback to delta_vec_mm)
+        p_ref_raw = _extract_position_mm(ref_dict)
+        p_oth_raw = _extract_position_mm(oth_dict)
+
+        p_ref = _as_pos3(p_ref_raw)
+        p_oth = _as_pos3(p_oth_raw)
+
+        # Build path from history
+        path_pts_raw = []
+        for h in self.history:
+            jp = h.get("json")
+            if not jp:
+                continue
+            try:
+                d = _load_snapshot_like(jp)
+                p = _extract_position_mm(d)
+                path_pts_raw.append(p)
+            except Exception:
+                continue
+
+        path = _as_path_pts(path_pts_raw, p_ref[0], p_oth[0])
+
+        # ---- IMPORTANT: always pass float32 Nx3 arrays ----
+        # Points
+        self.pt_ref.setData(
+            pos=p_ref,
+            color=(0.38, 0.64, 0.98, 1.0),  # RGBA in 0..1
+            size=10,
+            pxMode=True
+        )
+        self.pt_oth.setData(
+            pos=p_oth,
+            color=(0.95, 0.75, 0.20, 1.0),
+            size=10,
+            pxMode=True
+        )
+
+        # Path line
+        self.pt_path.setData(
+            pos=path,
+            color=(1.0, 1.0, 1.0, 0.45),
+            mode="line_strip",
+            width=2
+        )
+
+        # Ref->Other vector line
+        vec = np.vstack([p_ref[0], p_oth[0]]).astype(np.float32)
+        self.vec_line.setData(
+            pos=vec,
+            color=(1.0, 0.45, 0.45, 0.85),
+            mode="lines",
+            width=3
+        )
+
+        # Camera center (safe)
+        center = path.mean(axis=0)
+        if not np.all(np.isfinite(center)):
+            center = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+
+        span = float(np.max(np.linalg.norm(path - center, axis=1))) if len(path) > 1 else 50.0
+        self.view3d.opts["center"] = QtGui.QVector3D(float(center[0]), float(center[1]), float(center[2]))
+        self.view3d.opts["distance"] = float(max(200.0, min(1200.0, span * 3.0)))
+
 class TrackerUI(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
@@ -421,8 +927,9 @@ class TrackerUI(QtWidgets.QWidget):
         self.btn_stop   = QtWidgets.QPushButton("Stop")
         self.btn_save   = QtWidgets.QPushButton("Save Target")
         self.btn_report = QtWidgets.QPushButton("Report Δpos")
+        self.btn_abs_err = QtWidgets.QPushButton("Abs Error...")
 
-        for b in (self.btn_start, self.btn_stop, self.btn_save, self.btn_report):
+        for b in (self.btn_start, self.btn_stop, self.btn_save, self.btn_report, self.btn_abs_err):
             b.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
             b.setStyleSheet(
                 f"""
@@ -458,6 +965,7 @@ class TrackerUI(QtWidgets.QWidget):
         buttons.addStretch(1)
         buttons.addWidget(self.btn_save)
         buttons.addWidget(self.btn_report)
+        buttons.addWidget(self.btn_abs_err)
 
         # --- Root layout ---
         top = QtWidgets.QVBoxLayout()
@@ -483,9 +991,10 @@ class TrackerUI(QtWidgets.QWidget):
         self.btn_stop.clicked.connect(self.stop_tracker)
         self.btn_save.clicked.connect(self.control.request_save)
         self.btn_report.clicked.connect(self.control.on_report_clicked)
+        self.btn_abs_err.clicked.connect(self.open_abs_error_dialog)
 
         self._set_controls_enabled(False)
-
+    
     # ------- threading control -------
     def start_tracker(self):
         if self._safe_thread_running():
@@ -576,23 +1085,6 @@ class TrackerUI(QtWidgets.QWidget):
             self._toast_timer.start(2000)
             return
 
-        # # live values
-        # t = float(data.get("translation_error_mm", 0))
-        # r = float(data.get("rotation_error_deg", 0))
-        # s = float(data.get("score", 0))
-        # vec = data.get("delta_vec_mm", [0.0,0.0,0.0])
-
-        # self.card_trans.value.setText(f"{t:.2f}")
-        # self.card_rot.value.setText(f"{r:.2f}")
-        # self.card_score.value.setText(f"{s:.2f}")
-
-        # ok = bool(data.get("within_tol", False))
-        # self.status_pill.setText("OK" if ok else "ADJUST")
-        # self.status_pill.setStyleSheet(PILL_OK_STYLE if ok else PILL_ADJ_STYLE)
-      
-        # # Update 3D arrow (direction & magnitude)
-        # self.arrow.set_vector_mm(subject_to_view(vec))
-
         # live values
         t = float(data.get("translation_error_mm", 0) or 0)
         r = float(data.get("rotation_error_deg", 0) or 0)
@@ -624,6 +1116,37 @@ class TrackerUI(QtWidgets.QWidget):
             # underlying C++ object was deleted; clear our reference
             self.thread = None
             return False
+
+    # Absolute error dialog helper
+    def _get_live_snapshot_like(self) -> dict:
+        """
+        Convert current live status (self._last_status) into the same dict schema
+        as the saved snapshot JSON, so we can compare apples-to-apples.
+        """
+        if not self._last_status:
+            raise ValueError("No live status yet. Start tracker first.")
+        d = self._last_status
+
+        return {
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "delta_vec_mm": d.get("delta_vec_mm", [0.0, 0.0, 0.0]),
+            "translation_error_mm": float(d.get("translation_error_mm", 0.0) or 0.0),
+            "rotation_error_deg": float(d.get("rotation_error_deg", 0.0) or 0.0),
+            "score": float(d.get("score", 0.0) or 0.0),
+            "within_tol": bool(d.get("within_tol", False)),
+        }
+
+    def open_abs_error_dialog(self):
+        if not self._saved_history:
+            QtWidgets.QMessageBox.information(
+                self,
+                "No snapshots yet",
+                "Save at least one snapshot first (then you can compare snapshot↔snapshot or live↔snapshot).",
+            )
+            return
+
+        dlg = AbsErrorDialog(self, history=self._saved_history, get_live_dict_callable=self._get_live_snapshot_like)
+        dlg.exec_()
 
 
 

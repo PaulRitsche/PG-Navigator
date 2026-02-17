@@ -1,0 +1,3 @@
+-> Re-placement failed
+-> Measure Phantom to estimate the effect of fixation of parts
+-> Do calibration with grid and participant completely fixed to determine effect of calibration. This failed already since movement of the participant induced an error of up to 3mm and 3 Degrees, while being taped to the participant. 
