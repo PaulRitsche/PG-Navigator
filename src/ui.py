@@ -416,73 +416,6 @@ def _load_snapshot_like(obj_or_path):
         raise FileNotFoundError(str(p))
     return json.loads(p.read_text(encoding="utf-8"))
 
-def _extract_vec_and_rot(d: dict):
-    """
-    Extracts (delta_vec_mm, rotation_error_deg) from a snapshot-like dict.
-    Make tolerant here if your keys differ.
-    """
-    # vector
-    vec = d.get("delta_vec_mm", None)
-    if vec is None:
-        # fallback attempts
-        vec = d.get("delta_vec", d.get("delta_mm", d.get("vec_mm", [0.0, 0.0, 0.0])))
-    vec = np.array(vec, dtype=float).reshape(3,)
-
-    # rotation
-    rot = d.get("rotation_error_deg", None)
-    if rot is None:
-        rot = d.get("rot_error_deg", d.get("rotation_deg", 0.0))
-    rot = float(rot or 0.0)
-    return vec, rot
-
-def compute_abs_errors_vec_rot(ref: dict, other: dict):
-    """
-    Absolute errors in SAME coordinate system:
-      - component abs errors (mm)
-      - euclidean distance (mm)
-      - abs rotation error difference (deg)
-    """
-    v_ref, r_ref = _extract_vec_and_rot(ref)
-    v_oth, r_oth = _extract_vec_and_rot(other)
-
-    dv = v_oth - v_ref
-    abs_comp = np.abs(dv)
-    dist = float(np.linalg.norm(dv))
-    abs_rot = float(abs(r_oth - r_ref))
-
-    return {
-        "v_ref": v_ref, "v_oth": v_oth,
-        "abs_comp_mm": abs_comp,
-        "dist_mm": dist,
-        "rot_abs_deg": abs_rot,
-        "rot_ref_deg": r_ref,
-        "rot_oth_deg": r_oth,
-    }
-
-def _extract_position_mm(d: dict) -> np.ndarray:
-    """
-    Try to extract an absolute 3D position (mm) from snapshot-like dict.
-    Supported:
-      - current_pos_mm: [x,y,z]
-      - current_pose: {"pos_mm":[x,y,z]} or {"pos":[...]} or {"t_mm":[...]}
-      - target_pos_mm similarly
-    Fallback:
-      - uses delta_vec_mm as a pseudo-position (error-space endpoint)
-    """
-    # 1) direct absolute position
-    if "current_pos_mm" in d and d["current_pos_mm"] is not None:
-        return np.array(d["current_pos_mm"], dtype=float).reshape(3,)
-
-    # 2) nested pose forms
-    pose = d.get("current_pose", None)
-    if isinstance(pose, dict):
-        for k in ("pos_mm", "pos", "t_mm", "t"):
-            if k in pose and pose[k] is not None:
-                return np.array(pose[k], dtype=float).reshape(3,)
-
-    # 3) fallback to delta vector endpoint (NOT absolute, but still visualizable)
-    vec, _ = _extract_vec_and_rot(d)
-    return np.array(vec, dtype=float).reshape(3,)
 
 def _as_pos3(arr, fallback=(0.0, 0.0, 0.0)) -> np.ndarray:
         """Return (1,3) float32 finite array suitable for GLScatterPlotItem."""
@@ -518,6 +451,27 @@ def _as_path_pts(pts_list, fallback_a, fallback_b) -> np.ndarray:
 
     return np.vstack(clean).astype(np.float32)
 
+def _extract_rb_positions_mm(d: dict) -> dict:
+    """
+    Extract absolute RB positions (mm) from snapshot/live dict.
+    Required keys:
+      - grid_pos_mm
+      - subject_pos_mm
+    Returns: {"grid": np.ndarray(3,), "subject": np.ndarray(3,)}
+    """
+    gp = d.get("grid_pos_mm", None)
+    sp = d.get("subject_pos_mm", None)
+    if gp is None or sp is None:
+        raise KeyError("Missing 'grid_pos_mm' or 'subject_pos_mm' in snapshot/live dict.")
+
+    grid = np.asarray(gp, dtype=np.float32).reshape(3,)
+    subj = np.asarray(sp, dtype=np.float32).reshape(3,)
+
+    if not (np.all(np.isfinite(grid)) and np.all(np.isfinite(subj))):
+        raise ValueError("Non-finite RB positions found (NaN/Inf).")
+
+    return {"grid": grid, "subject": subj}
+
 class AbsErrorDialog(QtWidgets.QDialog):
     """
     Compare:
@@ -528,7 +482,11 @@ class AbsErrorDialog(QtWidgets.QDialog):
     def __init__(self, parent, *, history, get_live_dict_callable):
         super().__init__(parent)
         self.setWindowTitle("Absolute Errors (same coordinate system)")
-        self.resize(900, 520)
+        self.resize(1250, 720)
+
+        # Give 3D more space than the text panel
+        # mid.addWidget(view_wrap, 3)
+        # mid.addWidget(self.txt, 2)
 
         self.history = history  # list of {"ts":..., "json":..., "csv":...}
         self.get_live = get_live_dict_callable
@@ -550,8 +508,8 @@ class AbsErrorDialog(QtWidgets.QDialog):
         row.addWidget(self.btn_add_files)
 
 
-        self.cmb_a = QtWidgets.QComboBox()
-        self.cmb_b = QtWidgets.QComboBox()
+        self.cmb_a = QtWidgets.QComboBox(sizeAdjustPolicy=QtWidgets.QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.cmb_b = QtWidgets.QComboBox(sizeAdjustPolicy=QtWidgets.QComboBox.AdjustToMinimumContentsLengthWithIcon)
         row.addWidget(QtWidgets.QLabel("A (ref):"))
         row.addWidget(self.cmb_a, 2)
         row.addWidget(QtWidgets.QLabel("B (other):"))
@@ -567,34 +525,76 @@ class AbsErrorDialog(QtWidgets.QDialog):
         # LEFT: 3D scene
         self.view3d = gl.GLViewWidget()
         self.view3d.setBackgroundColor(QtGui.QColor(17, 24, 39))  # similar to CARD_BG
-        self.view3d.opts["distance"] = 400
-        self.view3d.opts["elevation"] = 18
-        self.view3d.opts["azimuth"] = 45
+        self.view3d.opts["distance"] = 10
+        self.view3d.opts["elevation"] = 90   # look down onto XY plane
+        self.view3d.opts["azimuth"] = -90    # rotate so +Y points up on screen, +X right
 
         # optional grid/axis
         grid = gl.GLGridItem(glOptions="additive")
-        grid.setSize(400, 400, 0)
-        grid.setSpacing(20, 20, 20)
+        grid.setSize(10, 10, 10)
+        grid.setSpacing(2, 2, 2)
         grid.setColor((255, 255, 255, 60))
         grid.rotate(90, 1, 0, 0)  # put in XY plane
-        self.view3d.addItem(grid)
-
+        
+        # Build axis
         axis = gl.GLAxisItem()
-        axis.setSize(120, 120, 120)
+        axis.setSize(1, 1, 1)
+     
         self.view3d.addItem(axis)
 
-        # 3D objects: points and paths
-        self.pt_ref = gl.GLScatterPlotItem(size=10, pxMode=True)
-        self.pt_oth = gl.GLScatterPlotItem(size=10, pxMode=True)
-        self.pt_path = gl.GLLinePlotItem(glOptions="additive", width=2)
 
-        # ref->other vector
+        # Draw center
+        self._origin_md = MeshData.sphere(rows=8, cols=16, radius=1.0)
+        self.origin_marker = gl.GLMeshItem(
+            meshdata=self._origin_md,
+            smooth=True,
+            drawFaces=True,
+            drawEdges=False,
+            glOptions="additive",
+        )
+        self.origin_marker.setColor((1.0, 1.0, 1.0, 1.0))
+        self.origin_marker.scale(0.008, 0.008, 0.008)   # 8 mm radius
+        self.origin_marker.translate(0.0, 0.0, 0.0)
+        self.view3d.addItem(self.origin_marker)
+
+
+        # --- Stable "points" as small spheres (avoid GLScatterPlotItem driver issues) ---
+        self._sphere_md = MeshData.sphere(rows=10, cols=20, radius=1.0)
+
+        def _mk_sphere(color_rgba):
+            it = gl.GLMeshItem(
+                meshdata=self._sphere_md,
+                smooth=True,
+                drawFaces=True,
+                drawEdges=False,
+                glOptions="additive",
+            )
+            it.setColor(color_rgba)  # RGBA in 0..1
+            self.view3d.addItem(it)
+            return it
+
+        # A/B grid + subject spheres
+        self.sph_gA = _mk_sphere((0, 0, 1, 0.5))   # Grid(A)
+        self.sph_sA = _mk_sphere((0, 0, 1, 1.0))   # Subject(A)
+        self.sph_gB = _mk_sphere((1, 0.0, 0.0, 0.5))   # Grid(B)
+        self.sph_sB = _mk_sphere((1, 0.0, 0.0, 1.0))   # Subject(B)
+
+        # Lines
+        self.pt_path = gl.GLLinePlotItem(glOptions="additive", width=2)
         self.vec_line = gl.GLLinePlotItem(glOptions="additive", width=3)
 
         self.view3d.addItem(self.pt_path)
         self.view3d.addItem(self.vec_line)
-        self.view3d.addItem(self.pt_ref)
-        self.view3d.addItem(self.pt_oth)
+
+        # Optional: Grid->Subject segments
+        self.line_A = gl.GLLinePlotItem(glOptions="additive", width=3)
+        self.line_B = gl.GLLinePlotItem(glOptions="additive", width=3)
+        self.view3d.addItem(self.line_A)
+        self.view3d.addItem(self.line_B)
+
+        # Sphere visual size (mm)
+        self._sphere_radius_mm = 0.01
+
 
         # wrap 3D in a frame for style consistency
         view_wrap = QtWidgets.QFrame()
@@ -608,24 +608,56 @@ class AbsErrorDialog(QtWidgets.QDialog):
         mid.addWidget(view_wrap, 2)
 
         # MIDDLE: bar plots (same as before)
-        plots_col = QtWidgets.QVBoxLayout()
-        mid.addLayout(plots_col, 2)
+        # plots_col = QtWidgets.QVBoxLayout()
+        # mid.addLayout(plots_col, 2)
 
-        self.plot_vec = pg.PlotWidget()
-        self.plot_vec.setBackground(CARD_BG)
-        self.plot_vec.showGrid(x=True, y=True, alpha=0.2)
-        self.plot_vec.setTitle("Abs component errors |Δx| |Δy| |Δz| (mm)", color=TEXT_MAIN)
+        # self.plot_vec = pg.PlotWidget()
+        # self.plot_vec.setBackground(CARD_BG)
+        # self.plot_vec.showGrid(x=True, y=True, alpha=0.2)
+        # self.plot_vec.setTitle("Abs component errors |Δx| |Δy| |Δz| (mm)", color=TEXT_MAIN)
 
-        self.plot_rot = pg.PlotWidget()
-        self.plot_rot.setBackground(CARD_BG)
-        self.plot_rot.showGrid(x=True, y=True, alpha=0.2)
-        self.plot_rot.setTitle("Abs rotation error |Δrot| (deg)", color=TEXT_MAIN)
+        # self.plot_rot = pg.PlotWidget()
+        # self.plot_rot.setBackground(CARD_BG)
+        # self.plot_rot.showGrid(x=True, y=True, alpha=0.2)
+        # self.plot_rot.setTitle("Abs rotation error |Δrot| (deg)", color=TEXT_MAIN)
 
-        plots_col.addWidget(self.plot_vec, 2)
-        plots_col.addWidget(self.plot_rot, 1)
+        # plots_col.addWidget(self.plot_vec, 2)
+        # plots_col.addWidget(self.plot_rot, 1)
+
+        self.legend_widget = QtWidgets.QFrame(self.view3d)
+        self.legend_widget.setStyleSheet("""
+        QFrame {
+            background-color: rgba(20, 20, 30, 180);
+            border-radius: 8px;
+        }
+        """)
+
+        legend_layout = QtWidgets.QVBoxLayout(self.legend_widget)
+        legend_layout.setContentsMargins(8, 8, 8, 8)
+
+        def _legend_entry(color, text):
+            row = QtWidgets.QHBoxLayout()
+            box = QtWidgets.QLabel()
+            box.setFixedSize(14, 14)
+            box.setStyleSheet(f"background-color: rgb({int(color[0]*255)}, {int(color[1]*255)}, {int(color[2]*255)});")
+            label = QtWidgets.QLabel(text)
+            label.setStyleSheet("color: white;")
+            row.addWidget(box)
+            row.addWidget(label)
+            row.addStretch()
+            legend_layout.addLayout(row)
+
+        _legend_entry((0, 0, 0.5, 0.5), "Grid (A)")
+        _legend_entry((0, 0, 1, 1), "Grid (B)")
+        _legend_entry((0.5, 0, 0, 0.5), "Subject (A)")
+        _legend_entry((1.00, 0, 0, 1.0), "Subject (B)")
+
+        self.legend_widget.move(20, 20)
+        self.legend_widget.show()
+
 
         # RIGHT: stats
-        self.txt = QtWidgets.QPlainTextEdit()
+        self.txt = QtWidgets.QTextEdit()
         self.txt.setReadOnly(True)
         self.txt.setStyleSheet(f"background-color:{CARD_BG}; color:{TEXT_MAIN}; border-radius:8px; padding:8px;")
         mid.addWidget(self.txt, 2)
@@ -640,7 +672,8 @@ class AbsErrorDialog(QtWidgets.QDialog):
 
 
         self._on_mode_changed()
-
+    
+    
     def _refresh_history(self):
         """
         Populate combos from self.history (which may include runtime snapshots + imported ones).
@@ -712,26 +745,26 @@ class AbsErrorDialog(QtWidgets.QDialog):
             self.cmb_a.setEnabled(True)
             self.cmb_a.setToolTip("")
 
-    def _barplot_vec(self, abs_comp_mm):
-        self.plot_vec.clear()
-        # 3 bars at x=0,1,2
-        x = np.array([0, 1, 2], dtype=float)
-        y = np.array(abs_comp_mm, dtype=float)
-        bg = pg.BarGraphItem(x=x, height=y, width=0.6, brush=pg.mkBrush(96, 165, 250, 190))
-        self.plot_vec.addItem(bg)
-        ax = self.plot_vec.getAxis("bottom")
-        ax.setTicks([[(0, "x"), (1, "y"), (2, "z")]])
-        self.plot_vec.setLabel("left", "mm")
+    # def _barplot_vec(self, abs_comp_mm):
+    #     self.plot_vec.clear()
+    #     # 3 bars at x=0,1,2
+    #     x = np.array([0, 1, 2], dtype=float)
+    #     y = np.array(abs_comp_mm, dtype=float)
+    #     bg = pg.BarGraphItem(x=x, height=y, width=0.6, brush=pg.mkBrush(96, 165, 250, 190))
+    #     self.plot_vec.addItem(bg)
+    #     ax = self.plot_vec.getAxis("bottom")
+    #     ax.setTicks([[(0, "x"), (1, "y"), (2, "z")]])
+    #     self.plot_vec.setLabel("left", "mm")
 
-    def _barplot_rot(self, rot_abs_deg):
-        self.plot_rot.clear()
-        x = np.array([0], dtype=float)
-        y = np.array([rot_abs_deg], dtype=float)
-        bg = pg.BarGraphItem(x=x, height=y, width=0.6, brush=pg.mkBrush(245, 158, 11, 200))
-        self.plot_rot.addItem(bg)
-        ax = self.plot_rot.getAxis("bottom")
-        ax.setTicks([[(0, "Δrot")]])
-        self.plot_rot.setLabel("left", "deg")
+    # def _barplot_rot(self, rot_abs_deg):
+    #     self.plot_rot.clear()
+    #     x = np.array([0], dtype=float)
+    #     y = np.array([rot_abs_deg], dtype=float)
+    #     bg = pg.BarGraphItem(x=x, height=y, width=0.6, brush=pg.mkBrush(245, 158, 11, 200))
+    #     self.plot_rot.addItem(bg)
+    #     ax = self.plot_rot.getAxis("bottom")
+    #     ax.setTicks([[(0, "Δrot")]])
+    #     self.plot_rot.setLabel("left", "deg")
 
     def _on_compute(self):
         try:
@@ -754,7 +787,14 @@ class AbsErrorDialog(QtWidgets.QDialog):
                     raise ValueError("Pick a snapshot (B).")
 
                 ref_dict = _load_snapshot_like(b["json"])
+                
+                # Convert live mm to m 
+                # ref_dict["grid_pos_mm"] = [i*1000 for i in ref_dict["grid_pos_mm"]]
+                # ref_dict["subject_pos_mm"] = [i*1000 for i in ref_dict["subject_pos_mm"]]
+               
                 oth_dict = live
+                oth_dict["grid_pos_mm"] = [i/1000 for i in oth_dict["grid_pos_mm"]]
+                oth_dict["subject_pos_mm"] = [i/1000 for i in oth_dict["subject_pos_mm"]]
 
                 a_label = "SNAPSHOT (ref)"
                 b_label = "LIVE (other)"
@@ -767,48 +807,79 @@ class AbsErrorDialog(QtWidgets.QDialog):
                     raise ValueError("Pick two snapshots.")
 
                 ref_dict = _load_snapshot_like(a["json"])
-                oth_dict = _load_snapshot_like(b["json"])
+                oth_dict = _load_snapshot_like(b["json"])              
 
                 a_label = "A (ref)"
                 b_label = "B (other)"
 
             # ---- COMPUTE ----
-            res = compute_abs_errors_vec_rot(ref_dict, oth_dict)
+            #res = compute_abs_errors_vec_rot(ref_dict, oth_dict)
 
             # ---- RENDER ----
-            self._barplot_vec(res["abs_comp_mm"])
-            self._barplot_rot(res["rot_abs_deg"])
+            #\self._barplot_vec(res["abs_comp_mm"])
+            #self._barplot_rot(res["rot_abs_deg"])
             self._render_3d(ref_dict, oth_dict)
 
-            # ---- TEXT ----
-            self.txt.setPlainText(
-                f"{a_label} vec (mm): {res['v_ref'].tolist()}\n"
-                f"{b_label} vec (mm): {res['v_oth'].tolist()}\n\n"
-                f"Abs component errors (mm): {res['abs_comp_mm'].tolist()}\n"
-                f"Euclidean |Δvec| (mm): {res['dist_mm']:.4f}\n\n"
-                f"{a_label} rot (deg): {res['rot_ref_deg']:.4f}\n"
-                f"{b_label} rot (deg): {res['rot_oth_deg']:.4f}\n"
-                f"Abs |Δrot| (deg): {res['rot_abs_deg']:.4f}\n"
-            )
+            def _span(val, nd=3):
+                # green for small magnitude, amber medium, red large (tune thresholds)
+                a = abs(float(val))
+                if a < 0.05:   col = "#34d399"   # green
+                elif a < 0.1: col = "#fbbf24"   # amber
+                else:       col = "#f87171"   # red
+                sign = "+" if val >= 0 else "−"
+                return f"<span style='color:{col}; font-family:Consolas, monospace;'>{sign}{abs(val):.{nd}f}</span>"
+
+            def _row(name, v):
+                x,y,z = [float(i) for i in v]
+                return (
+                    f"<tr>"
+                    f"<td style='padding-right:10px; color:{TEXT_DIM};'>{name}</td>"
+                    f"<td>{_span(x)}</td><td>{_span(y)}</td><td>{_span(z)}</td>"
+                    f"</tr>"
+                )
+
+            A = _extract_rb_positions_mm(ref_dict)
+            B = _extract_rb_positions_mm(oth_dict)
+
+            #self.txt.setPlainText( f"{a_label}\n" f" Grid (mm): {A['grid'].tolist()}\n" f" Subject (mm): {A['subject'].tolist()}\n\n" f"{b_label}\n" f" Grid (mm): {B['grid'].tolist()}\n" f" Subject (mm): {B['subject'].tolist()}\n" )
+            d_grid = np.asarray(B["grid"]) - np.asarray(A["grid"])
+            d_sub  = np.asarray(B["subject"]) - np.asarray(A["subject"])
+
+            html = f"""
+            <div style="font-family:Consolas, monospace; font-size:12px;">
+            <div style="margin-bottom:8px;"><b>{a_label}</b></div>
+            <table>
+                {_row("Grid (m)", A["grid"])}
+                {_row("Subj (m)", A["subject"])}
+            </table>
+            <div style="margin:10px 0 8px;"><b>{b_label}</b></div>
+            <table>
+                {_row("Grid (m)", B["grid"])}
+                {_row("Subj (m)", B["subject"])}
+            </table>
+            <div style="margin:10px 0 6px;"><b>Δ (B − A)</b></div>
+            <table>
+                {_row("ΔGrid (m)", d_grid)}
+                {_row("ΔSubj (m)", d_sub)}
+            </table>
+            </div>
+            """
+
+            self.txt.setHtml(html)
 
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Abs error failed", str(e))
 
     def _render_3d(self, ref_dict: dict, oth_dict: dict):
-        """
-        Render:
-        - ref point and other point
-        - vector ref -> other
-        - path through snapshot history
-        """
-        # Extract positions (may fallback to delta_vec_mm)
-        p_ref_raw = _extract_position_mm(ref_dict)
-        p_oth_raw = _extract_position_mm(oth_dict)
+        A = _extract_rb_positions_mm(ref_dict)
+        B = _extract_rb_positions_mm(oth_dict)
 
-        p_ref = _as_pos3(p_ref_raw)
-        p_oth = _as_pos3(p_oth_raw)
+        gA = _as_pos3(A["grid"])
+        sA = _as_pos3(A["subject"])
+        gB = _as_pos3(B["grid"])
+        sB = _as_pos3(B["subject"])
 
-        # Build path from history
+        # --- History path: grid positions only ---
         path_pts_raw = []
         for h in self.history:
             jp = h.get("json")
@@ -816,38 +887,47 @@ class AbsErrorDialog(QtWidgets.QDialog):
                 continue
             try:
                 d = _load_snapshot_like(jp)
-                p = _extract_position_mm(d)
-                path_pts_raw.append(p)
+                P = _extract_rb_positions_mm(d)
+                path_pts_raw.append(P["grid"])
             except Exception:
                 continue
 
-        path = _as_path_pts(path_pts_raw, p_ref[0], p_oth[0])
+        path = _as_path_pts(path_pts_raw, gA[0], gB[0])
 
-        # ---- IMPORTANT: always pass float32 Nx3 arrays ----
-        # Points
-        self.pt_ref.setData(
-            pos=p_ref,
-            color=(0.38, 0.64, 0.98, 1.0),  # RGBA in 0..1
-            size=10,
-            pxMode=True
-        )
-        self.pt_oth.setData(
-            pos=p_oth,
-            color=(0.95, 0.75, 0.20, 1.0),
-            size=10,
-            pxMode=True
-        )
+        def _place_sphere(item: gl.GLMeshItem, p_mm: np.ndarray, r_mm: float):
+            item.resetTransform()
+            item.scale(r_mm, r_mm, r_mm)
+            item.translate(float(p_mm[0]), float(p_mm[1]), float(p_mm[2]))
 
-        # Path line
-        self.pt_path.setData(
-            pos=path,
-            color=(1.0, 1.0, 1.0, 0.45),
-            mode="line_strip",
-            width=2
-        )
+        # actually place the 4 spheres
+        r = float(getattr(self, "_sphere_radius_mm", 6.0))
+        _place_sphere(self.sph_gA, gA[0], r)
+        _place_sphere(self.sph_sA, sA[0], r)
+        _place_sphere(self.sph_gB, gB[0], r)
+        _place_sphere(self.sph_sB, sB[0], r)
 
-        # Ref->Other vector line
-        vec = np.vstack([p_ref[0], p_oth[0]]).astype(np.float32)
+        # # --- Path line (grid history) ---
+        # self.pt_path.setData(
+        #     pos=path.astype(np.float32),
+        #     color=(1.0, 1.0, 1.0, 0.35),
+        #     mode="line_strip",
+        #     width=2
+        # )
+
+        # --- Lines Grid->Subject for each snapshot ---
+        if not hasattr(self, "line_A"):
+            self.line_A = gl.GLLinePlotItem(glOptions="additive", width=3)
+            self.line_B = gl.GLLinePlotItem(glOptions="additive", width=3)
+            self.view3d.addItem(self.line_A)
+            self.view3d.addItem(self.line_B)
+
+        segA = np.vstack([gA[0], sA[0]]).astype(np.float32)
+        segB = np.vstack([gB[0], sB[0]]).astype(np.float32)
+        self.line_A.setData(pos=segA, color=(0.38, 0.64, 0.98, 0.7), mode="lines", width=3)
+        self.line_B.setData(pos=segB, color=(0.95, 0.75, 0.20, 0.7), mode="lines", width=3)
+
+        # --- Grid(A)->Grid(B) ---
+        vec = np.vstack([gA[0], gB[0]]).astype(np.float32)
         self.vec_line.setData(
             pos=vec,
             color=(1.0, 0.45, 0.45, 0.85),
@@ -855,14 +935,24 @@ class AbsErrorDialog(QtWidgets.QDialog):
             width=3
         )
 
-        # Camera center (safe)
-        center = path.mean(axis=0)
+        # --- Camera center ---
+        pts = np.vstack([gA[0], sA[0], gB[0], sB[0], path.mean(axis=0)]).astype(np.float32)
+        center = pts.mean(axis=0)
         if not np.all(np.isfinite(center)):
             center = np.array([0.0, 0.0, 0.0], dtype=np.float32)
 
-        span = float(np.max(np.linalg.norm(path - center, axis=1))) if len(path) > 1 else 50.0
-        self.view3d.opts["center"] = QtGui.QVector3D(float(center[0]), float(center[1]), float(center[2]))
-        self.view3d.opts["distance"] = float(max(200.0, min(1200.0, span * 3.0)))
+        all_pts = np.vstack([gA[0], sA[0], gB[0], sB[0], path]).astype(np.float32)
+        dists = np.linalg.norm(all_pts - center, axis=1)
+        span = float(np.nanmax(dists)) if dists.size else 50.0
+
+        # Keep global origin as scene origin
+        self.view3d.opts["center"] = QtGui.QVector3D(0.0, 0.0, 0.0)
+
+        # Only adjust distance (optional)
+        self.view3d.opts["distance"] = float(max(1.0, min(0.1, span * 3.0)))
+
+
+
 
 class TrackerUI(QtWidgets.QWidget):
     def __init__(self):
@@ -1119,31 +1209,28 @@ class TrackerUI(QtWidgets.QWidget):
 
     # Absolute error dialog helper
     def _get_live_snapshot_like(self) -> dict:
-        """
-        Convert current live status (self._last_status) into the same dict schema
-        as the saved snapshot JSON, so we can compare apples-to-apples.
-        """
         if not self._last_status:
             raise ValueError("No live status yet. Start tracker first.")
         d = self._last_status
 
+        # Must exist now because we added them to tracker live emit
         return {
             "ts": datetime.now().isoformat(timespec="seconds"),
-            "delta_vec_mm": d.get("delta_vec_mm", [0.0, 0.0, 0.0]),
-            "translation_error_mm": float(d.get("translation_error_mm", 0.0) or 0.0),
-            "rotation_error_deg": float(d.get("rotation_error_deg", 0.0) or 0.0),
-            "score": float(d.get("score", 0.0) or 0.0),
-            "within_tol": bool(d.get("within_tol", False)),
+            "grid_pos_mm": d.get("grid_pos_mm"),
+            "subject_pos_mm": d.get("subject_pos_mm"),
+            "grid_quat": d.get("grid_quat"),
+            "subject_quat": d.get("subject_quat"),
         }
 
+
     def open_abs_error_dialog(self):
-        if not self._saved_history:
-            QtWidgets.QMessageBox.information(
-                self,
-                "No snapshots yet",
-                "Save at least one snapshot first (then you can compare snapshot↔snapshot or live↔snapshot).",
-            )
-            return
+        # if not self._saved_history:
+        #     QtWidgets.QMessageBox.information(
+        #         self,
+        #         "No snapshots yet",
+        #         "Save at least one snapshot first (then you can compare snapshot↔snapshot or live↔snapshot).",
+        #     )
+        #     return
 
         dlg = AbsErrorDialog(self, history=self._saved_history, get_live_dict_callable=self._get_live_snapshot_like)
         dlg.exec_()

@@ -482,9 +482,16 @@ def run_tracker(on_update: Optional[Callable[[dict], None]] = None,
                                 "rotation_error_deg": round(rot_err_deg, 2),
                                 "score": round(score, 2),
                                 "within_tol": within_tol,
-                                "delta_vec_mm": [round(dx, 2), round(dy, 2), round(dz, 2)]
+                                "delta_vec_mm": [round(dx, 2), round(dy, 2), round(dz, 2)],
+
+                                # --- NEW: absolute RB poses in world coordinates (mm) ---
+                                "grid_pos_mm": [float(pg[0]*1000.0), float(pg[1]*1000.0), float(pg[2]*1000.0)],
+                                "subject_pos_mm": [float(ps[0]*1000.0), float(ps[1]*1000.0), float(ps[2]*1000.0)],
+                                "grid_quat": [float(qg[0]), float(qg[1]), float(qg[2]), float(qg[3])],
+                                "subject_quat": [float(qs[0]), float(qs[1]), float(qs[2]), float(qs[3])],
                             })
                             last_emit = now
+
 
                         if (now - last_log) >= LOG_INTERVAL_S:
                             writer.writerow([f"{now:.3f}", f"{trans_err_mm:.2f}", f"{rot_err_deg:.2f}", f"{score:.2f}"])
