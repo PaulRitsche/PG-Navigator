@@ -510,9 +510,9 @@ class AbsErrorDialog(QtWidgets.QDialog):
 
         self.cmb_a = QtWidgets.QComboBox(sizeAdjustPolicy=QtWidgets.QComboBox.AdjustToMinimumContentsLengthWithIcon)
         self.cmb_b = QtWidgets.QComboBox(sizeAdjustPolicy=QtWidgets.QComboBox.AdjustToMinimumContentsLengthWithIcon)
-        row.addWidget(QtWidgets.QLabel("A (ref):"))
+        row.addWidget(QtWidgets.QLabel("A (other):"))
         row.addWidget(self.cmb_a, 2)
-        row.addWidget(QtWidgets.QLabel("B (other):"))
+        row.addWidget(QtWidgets.QLabel("B (ref):"))
         row.addWidget(self.cmb_b, 2)
 
         self.btn_compute = QtWidgets.QPushButton("Compute")
@@ -796,8 +796,8 @@ class AbsErrorDialog(QtWidgets.QDialog):
                 oth_dict["grid_pos_mm"] = [i/1000 for i in oth_dict["grid_pos_mm"]]
                 oth_dict["subject_pos_mm"] = [i/1000 for i in oth_dict["subject_pos_mm"]]
 
-                a_label = "SNAPSHOT (ref)"
-                b_label = "LIVE (other)"
+                a_label = "LIVE (other)"
+                b_label = "Snapshot (ref)"
 
             else:  # Snapshot vs Snapshot
                 a = self.cmb_a.currentData()
@@ -806,11 +806,11 @@ class AbsErrorDialog(QtWidgets.QDialog):
                 if not a or not b or not a.get("json") or not b.get("json"):
                     raise ValueError("Pick two snapshots.")
 
-                ref_dict = _load_snapshot_like(a["json"])
-                oth_dict = _load_snapshot_like(b["json"])              
+                oth_dict = _load_snapshot_like(a["json"])
+                ref_dict = _load_snapshot_like(b["json"])              
 
-                a_label = "A (ref)"
-                b_label = "B (other)"
+                a_label = "A (other)"
+                b_label = "B (ref)"
 
             # ---- COMPUTE ----
             #res = compute_abs_errors_vec_rot(ref_dict, oth_dict)
@@ -838,8 +838,8 @@ class AbsErrorDialog(QtWidgets.QDialog):
                     f"</tr>"
                 )
 
-            A = _extract_rb_positions_mm(ref_dict)
-            B = _extract_rb_positions_mm(oth_dict)
+            B = _extract_rb_positions_mm(ref_dict)
+            A = _extract_rb_positions_mm(oth_dict)
 
             #self.txt.setPlainText( f"{a_label}\n" f" Grid (mm): {A['grid'].tolist()}\n" f" Subject (mm): {A['subject'].tolist()}\n\n" f"{b_label}\n" f" Grid (mm): {B['grid'].tolist()}\n" f" Subject (mm): {B['subject'].tolist()}\n" )
             d_grid = np.asarray(B["grid"]) - np.asarray(A["grid"])
@@ -849,18 +849,18 @@ class AbsErrorDialog(QtWidgets.QDialog):
             <div style="font-family:Consolas, monospace; font-size:12px;">
             <div style="margin-bottom:8px;"><b>{a_label}</b></div>
             <table>
-                {_row("Grid (m)", A["grid"])}
-                {_row("Subj (m)", A["subject"])}
+                {_row("Grid (mm)", A["grid"])}
+                {_row("Subj (mm)", A["subject"])}
             </table>
             <div style="margin:10px 0 8px;"><b>{b_label}</b></div>
             <table>
-                {_row("Grid (m)", B["grid"])}
-                {_row("Subj (m)", B["subject"])}
+                {_row("Grid (mm)", B["grid"])}
+                {_row("Subj (mm)", B["subject"])}
             </table>
-            <div style="margin:10px 0 6px;"><b>Δ (B − A)</b></div>
+            <div style="margin:10px 0 6px;"><b>Δ (ref − other)</b></div>
             <table>
-                {_row("ΔGrid (m)", d_grid)}
-                {_row("ΔSubj (m)", d_sub)}
+                {_row("ΔGrid (mm)", d_grid)}
+                {_row("ΔSubj (mm)", d_sub)}
             </table>
             </div>
             """
