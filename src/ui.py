@@ -2,7 +2,7 @@ import sys, math
 from PyQt5 import QtWidgets, QtCore, QtGui
 import pyqtgraph as pg
 import pyqtgraph.opengl as gl
-from pyqtgraph.opengl import MeshData, GLMeshItem
+from pyqtgraph.opengl import MeshData, GLMeshItem, GLTextItem
 from pathlib import Path
 from datetime import datetime
 import json
@@ -11,8 +11,8 @@ import tracker  # tracker.py alongside
 import numpy as np
 
 
-# TODO Handle loading/saving target poses in UI 
-# TODO Handle setting data paths in UI
+
+# TODO absolute error plotting and automatic change of probe position automatic
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -482,7 +482,7 @@ class AbsErrorDialog(QtWidgets.QDialog):
     def __init__(self, parent, *, history, get_live_dict_callable):
         super().__init__(parent)
         self.setWindowTitle("Absolute Errors (same coordinate system)")
-        self.resize(1250, 720)
+        self.resize(800, 600)
 
         # Give 3D more space than the text panel
         # mid.addWidget(view_wrap, 3)
@@ -527,8 +527,8 @@ class AbsErrorDialog(QtWidgets.QDialog):
         self.view3d.setBackgroundColor(QtGui.QColor(17, 24, 39))  # similar to CARD_BG
         self.view3d.opts["distance"] = 10
         self.view3d.opts["elevation"] = 90   # look down onto XY plane
-        self.view3d.opts["azimuth"] = -90    # rotate so +Y points up on screen, +X right
-
+        #self.view3d.opts["azimuth"] = -90    # rotate so +Y points up on screen, +X right
+        self.view3d.opts["azimuth"] = 15    # rotate so +X points up on screen, +Y right 
         # optional grid/axis
         grid = gl.GLGridItem(glOptions="additive")
         grid.setSize(10, 10, 10)
@@ -536,13 +536,24 @@ class AbsErrorDialog(QtWidgets.QDialog):
         grid.setColor((255, 255, 255, 60))
         grid.rotate(90, 1, 0, 0)  # put in XY plane
         
+        self._vis_scale = 1000.0   # meters -> millimetres for display
+        self._vis_unit = "m"
         # Build axis
         axis = gl.GLAxisItem()
         axis.setSize(1, 1, 1)
-     
         self.view3d.addItem(axis)
-
-
+        # Text labels at axis ends
+        axis_len = 1  # 50 mm
+        axis = gl.GLAxisItem()
+        axis.setSize(axis_len, axis_len, axis_len)
+        self.view3d.addItem(axis)
+        self.lbl_x = GLTextItem(pos=(axis_len, 0, 0), text=f"X ({self._vis_unit})", color=(255,255,255,200))
+        self.lbl_y = GLTextItem(pos=(0, axis_len, 0), text=f"Y ({self._vis_unit})", color=(255,255,255,200))
+        self.lbl_z = GLTextItem(pos=(0, 0, axis_len), text=f"Z ({self._vis_unit})", color=(255,255,255,200))
+        self.view3d.addItem(self.lbl_x)
+        self.view3d.addItem(self.lbl_y)
+        self.view3d.addItem(self.lbl_z)
+     
         # Draw center
         self._origin_md = MeshData.sphere(rows=8, cols=16, radius=1.0)
         self.origin_marker = gl.GLMeshItem(
@@ -574,10 +585,10 @@ class AbsErrorDialog(QtWidgets.QDialog):
             return it
 
         # A/B grid + subject spheres
-        self.sph_gA = _mk_sphere((0, 0, 1, 0.5))   # Grid(A)
-        self.sph_sA = _mk_sphere((0, 0, 1, 1.0))   # Subject(A)
-        self.sph_gB = _mk_sphere((1, 0.0, 0.0, 0.5))   # Grid(B)
-        self.sph_sB = _mk_sphere((1, 0.0, 0.0, 1.0))   # Subject(B)
+        self.sph_gA = _mk_sphere((0, 1, 0, 1))   # Grid(Ref)
+        self.sph_sA = _mk_sphere((1, 0, 0, 1))   # Participant (Ref)
+        self.sph_gB = _mk_sphere((0.5, 0.56, 0.0, 0.5))   # Grid(B)
+        self.sph_sB = _mk_sphere((1, 0.56, 0, 0.5))   # Participant (B)
 
         # Lines
         self.pt_path = gl.GLLinePlotItem(glOptions="additive", width=2)
@@ -594,7 +605,6 @@ class AbsErrorDialog(QtWidgets.QDialog):
 
         # Sphere visual size (mm)
         self._sphere_radius_mm = 0.01
-
 
         # wrap 3D in a frame for style consistency
         view_wrap = QtWidgets.QFrame()
@@ -647,10 +657,10 @@ class AbsErrorDialog(QtWidgets.QDialog):
             row.addStretch()
             legend_layout.addLayout(row)
 
-        _legend_entry((0, 0, 0.5, 0.5), "Grid (A)")
-        _legend_entry((0, 0, 1, 1), "Grid (B)")
-        _legend_entry((0.5, 0, 0, 0.5), "Subject (A)")
-        _legend_entry((1.00, 0, 0, 1.0), "Subject (B)")
+        _legend_entry((0, 1, 0, 1), "Grid (Ref)")
+        _legend_entry((0.5, 0.56, 0.0, 0.5), "Grid (B)")
+        _legend_entry((1, 0, 0, 1), "Participant (Ref)")
+        _legend_entry((1, 0.56, 0, 0.5), "Participant (B)")
 
         self.legend_widget.move(20, 20)
         self.legend_widget.show()
@@ -673,6 +683,9 @@ class AbsErrorDialog(QtWidgets.QDialog):
 
         self._on_mode_changed()
     
+    def _to_vis(self, xyz_m):
+        v = np.asarray(xyz_m, dtype=float).reshape(3,)
+        return (v * self._vis_scale).astype(np.float32)  # now in "mm"
     
     def _refresh_history(self):
         """
@@ -849,18 +862,18 @@ class AbsErrorDialog(QtWidgets.QDialog):
             <div style="font-family:Consolas, monospace; font-size:12px;">
             <div style="margin-bottom:8px;"><b>{a_label}</b></div>
             <table>
-                {_row("Grid (mm)", A["grid"])}
-                {_row("Subj (mm)", A["subject"])}
+                {_row("Grid (m)", A["grid"])}
+                {_row("Subj (m)", A["subject"])}
             </table>
             <div style="margin:10px 0 8px;"><b>{b_label}</b></div>
             <table>
-                {_row("Grid (mm)", B["grid"])}
-                {_row("Subj (mm)", B["subject"])}
+                {_row("Grid (m)", B["grid"])}
+                {_row("Subj (m)", B["subject"])}
             </table>
             <div style="margin:10px 0 6px;"><b>Δ (ref − other)</b></div>
             <table>
-                {_row("ΔGrid (mm)", d_grid)}
-                {_row("ΔSubj (mm)", d_sub)}
+                {_row("ΔGrid (m)", d_grid)}
+                {_row("ΔSubj (m)", d_sub)}
             </table>
             </div>
             """
