@@ -11,8 +11,7 @@ import tracker  # tracker.py alongside
 import numpy as np
 
 
-
-# TODO absolute error plotting and automatic change of probe position automatic
+#TODO handle 146 cm error in absolute error dialog: maybe we should convert to meters for display, or at least label units clearly? (currently we just plot in mm but say "mm" in axis labels)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -416,6 +415,94 @@ def _load_snapshot_like(obj_or_path):
         raise FileNotFoundError(str(p))
     return json.loads(p.read_text(encoding="utf-8"))
 
+def _extract_rb_positions_mm(d: dict) -> dict:
+    """
+    Extract absolute RB positions (mm) from snapshot/live dict.
+    Required keys:
+      - grid_pos_mm
+      - subject_pos_mm
+    Returns: {"grid": np.ndarray(3,), "subject": np.ndarray(3,)}
+    """
+    gp = d.get("grid_pos_mm", None)
+    sp = d.get("subject_pos_mm", None)
+    if gp is None or sp is None:
+        raise KeyError("Missing 'grid_pos_mm' or 'subject_pos_mm' in snapshot/live dict.")
+
+    grid = np.asarray(gp, dtype=np.float32).reshape(3,)
+    subj = np.asarray(sp, dtype=np.float32).reshape(3,)
+
+    if not (np.all(np.isfinite(grid)) and np.all(np.isfinite(subj))):
+        raise ValueError("Non-finite RB positions found (NaN/Inf).")
+
+    return {"grid": grid, "subject": subj}
+
+def _extract_vec_and_rot(d: dict):
+    """
+    Extracts (delta_vec_mm, rotation_error_deg) from a snapshot-like dict.
+    Make tolerant here if your keys differ.
+    """
+    # vector
+    vec = d.get("delta_vec_mm", None)
+    if vec is None:
+        # fallback attempts
+        vec = d.get("delta_vec", d.get("delta_mm", d.get("vec_mm", [0.0, 0.0, 0.0])))
+    vec = np.array(vec, dtype=float).reshape(3,)
+
+    # rotation
+    rot = d.get("rotation_error_deg", None)
+    if rot is None:
+        rot = d.get("rot_error_deg", d.get("rotation_deg", 0.0))
+    rot = float(rot or 0.0)
+    return vec, rot
+
+def compute_abs_errors_vec_rot(ref: dict, other: dict):
+    """
+    Absolute errors in SAME coordinate system:
+      - component abs errors (mm)
+      - euclidean distance (mm)
+      - abs rotation error difference (deg)
+    """
+    v_ref, r_ref = _extract_vec_and_rot(ref)
+    v_oth, r_oth = _extract_vec_and_rot(other)
+
+    dv = v_oth - v_ref
+    abs_comp = np.abs(dv)
+    dist = float(np.linalg.norm(dv))
+    abs_rot = float(abs(r_oth - r_ref))
+
+    return {
+        "v_ref": v_ref, "v_oth": v_oth,
+        "abs_comp_mm": abs_comp,
+        "dist_mm": dist,
+        "rot_abs_deg": abs_rot,
+        "rot_ref_deg": r_ref,
+        "rot_oth_deg": r_oth,
+    }
+
+def _extract_position_mm(d: dict) -> np.ndarray:
+    """
+    Try to extract an absolute 3D position (mm) from snapshot-like dict.
+    Supported:
+      - current_pos_mm: [x,y,z]
+      - current_pose: {"pos_mm":[x,y,z]} or {"pos":[...]} or {"t_mm":[...]}
+      - target_pos_mm similarly
+    Fallback:
+      - uses delta_vec_mm as a pseudo-position (error-space endpoint)
+    """
+    # 1) direct absolute position
+    if "current_pos_mm" in d and d["current_pos_mm"] is not None:
+        return np.array(d["current_pos_mm"], dtype=float).reshape(3,)
+
+    # 2) nested pose forms
+    pose = d.get("current_pose", None)
+    if isinstance(pose, dict):
+        for k in ("pos_mm", "pos", "t_mm", "t"):
+            if k in pose and pose[k] is not None:
+                return np.array(pose[k], dtype=float).reshape(3,)
+
+    # 3) fallback to delta vector endpoint (NOT absolute, but still visualizable)
+    vec, _ = _extract_vec_and_rot(d)
+    return np.array(vec, dtype=float).reshape(3,)
 
 def _as_pos3(arr, fallback=(0.0, 0.0, 0.0)) -> np.ndarray:
         """Return (1,3) float32 finite array suitable for GLScatterPlotItem."""
@@ -450,27 +537,6 @@ def _as_path_pts(pts_list, fallback_a, fallback_b) -> np.ndarray:
                 np.asarray(fallback_b, dtype=np.float32).reshape(-1)[:3]]
 
     return np.vstack(clean).astype(np.float32)
-
-def _extract_rb_positions_mm(d: dict) -> dict:
-    """
-    Extract absolute RB positions (mm) from snapshot/live dict.
-    Required keys:
-      - grid_pos_mm
-      - subject_pos_mm
-    Returns: {"grid": np.ndarray(3,), "subject": np.ndarray(3,)}
-    """
-    gp = d.get("grid_pos_mm", None)
-    sp = d.get("subject_pos_mm", None)
-    if gp is None or sp is None:
-        raise KeyError("Missing 'grid_pos_mm' or 'subject_pos_mm' in snapshot/live dict.")
-
-    grid = np.asarray(gp, dtype=np.float32).reshape(3,)
-    subj = np.asarray(sp, dtype=np.float32).reshape(3,)
-
-    if not (np.all(np.isfinite(grid)) and np.all(np.isfinite(subj))):
-        raise ValueError("Non-finite RB positions found (NaN/Inf).")
-
-    return {"grid": grid, "subject": subj}
 
 class AbsErrorDialog(QtWidgets.QDialog):
     """
@@ -665,7 +731,6 @@ class AbsErrorDialog(QtWidgets.QDialog):
         self.legend_widget.move(20, 20)
         self.legend_widget.show()
 
-
         # RIGHT: stats
         self.txt = QtWidgets.QTextEdit()
         self.txt.setReadOnly(True)
@@ -788,7 +853,7 @@ class AbsErrorDialog(QtWidgets.QDialog):
             oth_dict = None
             a_label = ""
             b_label = ""
-
+            print(f"Computing abs errors for mode: {mode}")
             if mode == "Live vs Snapshot":
                 # A = snapshot (ref), B = live
                 live = self.get_live()
@@ -806,6 +871,7 @@ class AbsErrorDialog(QtWidgets.QDialog):
                 # ref_dict["subject_pos_mm"] = [i*1000 for i in ref_dict["subject_pos_mm"]]
                
                 oth_dict = live
+                print("Live dict:", oth_dict)
                 oth_dict["grid_pos_mm"] = [i/1000 for i in oth_dict["grid_pos_mm"]]
                 oth_dict["subject_pos_mm"] = [i/1000 for i in oth_dict["subject_pos_mm"]]
 
@@ -964,9 +1030,6 @@ class AbsErrorDialog(QtWidgets.QDialog):
         # Only adjust distance (optional)
         self.view3d.opts["distance"] = float(max(1.0, min(0.1, span * 3.0)))
 
-
-
-
 class TrackerUI(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
@@ -1005,6 +1068,12 @@ class TrackerUI(QtWidgets.QWidget):
         self._toast_timer.setSingleShot(True)
         self._toast_timer.timeout.connect(lambda: self.preview_label.setText(""))
 
+        # --- relocation workflow state ---
+        self._baseline_snapshot = None
+        self._baseline_label = None
+        self._participant_target_abs = None  # {pos_m: [x,y,z], quat: [qx,qy,qz,qw]}
+        self._grid_target_abs = None        # {pos_m: [x,y,z], R: [[...],[...],[...]]}
+
 
         # --- 3D view (arrow only) ---
         # self.view3d = gl.GLViewWidget()
@@ -1032,7 +1101,20 @@ class TrackerUI(QtWidgets.QWidget):
         self.btn_report = QtWidgets.QPushButton("Report Δpos")
         self.btn_abs_err = QtWidgets.QPushButton("Abs Error...")
 
-        for b in (self.btn_start, self.btn_stop, self.btn_save, self.btn_report, self.btn_abs_err):
+        # Relocation controls
+        self.btn_set_baseline = QtWidgets.QPushButton("Set baseline…")
+        self.btn_probe_target = QtWidgets.QPushButton("Compute grid target")
+
+        # Navigation mode: which arrow to display
+        self.nav_mode = QtWidgets.QComboBox()
+        self.nav_mode.addItems([
+            "Grid → target (relative)",
+            "Participant → baseline (absolute)",
+            "Grid → corrected target (absolute)",
+        ])
+
+        for b in (self.btn_start, self.btn_stop, self.btn_save, self.btn_report, self.btn_abs_err,
+                  self.btn_set_baseline, self.btn_probe_target):
             b.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
             b.setStyleSheet(
                 f"""
@@ -1062,13 +1144,15 @@ class TrackerUI(QtWidgets.QWidget):
             """
         )
 
-        buttons = QtWidgets.QHBoxLayout()
-        buttons.addWidget(self.btn_start)
-        buttons.addWidget(self.btn_stop)
-        buttons.addStretch(1)
-        buttons.addWidget(self.btn_save)
-        buttons.addWidget(self.btn_report)
-        buttons.addWidget(self.btn_abs_err)
+        buttons = QtWidgets.QGridLayout()
+        buttons.addWidget(self.btn_start, 0, 0)
+        buttons.addWidget(self.btn_stop, 0, 1)
+        buttons.addWidget(self.nav_mode, 0, 2)
+        buttons.addWidget(self.btn_set_baseline, 1, 0)
+        buttons.addWidget(self.btn_probe_target, 1, 1)
+        buttons.addWidget(self.btn_save, 1, 2)
+        buttons.addWidget(self.btn_report, 2, 0)
+        buttons.addWidget(self.btn_abs_err, 2, 1)
 
         # --- Root layout ---
         top = QtWidgets.QVBoxLayout()
@@ -1095,6 +1179,9 @@ class TrackerUI(QtWidgets.QWidget):
         self.btn_save.clicked.connect(self.control.request_save)
         self.btn_report.clicked.connect(self.control.on_report_clicked)
         self.btn_abs_err.clicked.connect(self.open_abs_error_dialog)
+        self.btn_set_baseline.clicked.connect(self._pick_baseline_snapshot)
+        self.btn_probe_target.clicked.connect(self.compute_corrected_probe_target)
+        self.nav_mode.currentIndexChanged.connect(self._on_nav_mode_changed)
 
         self._set_controls_enabled(False)
     
@@ -1159,6 +1246,93 @@ class TrackerUI(QtWidgets.QWidget):
         self.btn_save.setEnabled(ok)
         self.btn_report.setEnabled(ok)
 
+    def _on_nav_mode_changed(self):
+        m = self.nav_mode.currentText()
+        if m.startswith("Participant") and not self._participant_target_abs:
+            self.preview_label.setText("No baseline set. Click 'Set baseline…' and choose a snapshot JSON.")
+            self._toast_timer.start(4000)
+        elif m.startswith("Grid") and not self._grid_target_abs:
+            self.preview_label.setText("No grid target. Set baseline, reposition participant, then click 'Compute grid target'.")
+            self._toast_timer.start(4500)
+
+    def _pick_baseline_snapshot(self):
+        """Pick a baseline snapshot JSON (previous session) and store participant target from it."""
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select baseline snapshot JSON", "", "Snapshot JSON (*.json)")
+        if not path:
+            return
+        p = Path(path)
+        d = json.loads(p.read_text(encoding="utf-8"))
+
+        # We require absolute participant pose in the snapshot
+        if d.get("subject_pos_mm") is None or d.get("subject_quat") is None:
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Baseline invalid",
+                "Snapshot missing subject_pos_mm/subject_quat.\nTake a new snapshot with the updated tracker.",
+            )
+            return
+
+        self._baseline_snapshot = d
+        self._baseline_label = p.name
+        self._participant_target_abs = {"pos_m": list(d["subject_pos_mm"]), "quat": list(d["subject_quat"])}
+        self._grid_target_abs = None  # reset because baseline changed
+
+        self.preview_label.setText(f"Baseline set: {p.name}. Switch to 'Participant → baseline (absolute)'.")
+        self._toast_timer.start(4500)
+
+    def compute_corrected_probe_target(self):
+        """Compute corrected probe target from baseline probe-in-participant + current live participant pose."""
+        if not self._baseline_snapshot:
+            QtWidgets.QMessageBox.information(self, "No baseline", "Set a baseline snapshot first (Set baseline…).")
+            return
+
+        base = self._baseline_snapshot
+        if base.get("grid_pos_mm") is None or base.get("grid_quat") is None:
+            QtWidgets.QMessageBox.critical(
+                self,
+                "No probe in baseline",
+                "Baseline snapshot has no grid pose.\nEnsure a rigid body named 'Grid' exists and take a snapshot.",
+            )
+            return
+
+        live = self._get_live_snapshot_like()
+        if live.get("subject_pos_mm") is None or live.get("subject_quat") is None:
+            QtWidgets.QMessageBox.critical(self, "No live participant", "No live participant pose available yet.")
+            return
+
+        # Baseline participant + probe
+        pS0 = np.asarray(base["subject_pos_mm"], float).reshape(3,)
+        RS0 = tracker.rotmat_from_quat(np.asarray(base["subject_quat"], float).reshape(4,))
+        pP0 = np.asarray(base["grid_pos_mm"], float).reshape(3,)
+        RP0 = tracker.rotmat_from_quat(np.asarray(base["grid_quat"], float).reshape(4,))
+
+        # Correct for scale if baseline is in mm but live is in m (or vice versa)
+        pS0 = np.asarray([i*1000 for i in pS0])
+        pP0 = np.asarray([i*1000 for i in pP0])
+        
+        # Live participant
+        pS  = np.asarray(live["subject_pos_mm"], float).reshape(3,)
+        RS  = tracker.rotmat_from_quat(np.asarray(live["subject_quat"], float).reshape(4,))
+
+        print("baseline participant pos (mm):", pS0)
+        print("Baseline grid pos (mm):", pP0)
+
+        # Grid in participant coordinates from baseline
+        R_SP = RS0.T @ RP0
+        t_SP = RS0.T @ (pP0 - pS0)
+        print("Baseline grid in participant rot:", RS0.T)
+        print("Baseline grid in participant coords:", t_SP)
+
+        # Target grid in world today
+        R_tgt = RS @ R_SP
+        p_tgt = pS + RS @ t_SP
+
+        print("Corrected grid target pos (mm):", p_tgt)
+
+        self._grid_target_abs = {"pos_m": p_tgt.tolist(), "R": R_tgt.tolist()}
+        self.preview_label.setText("Grid target computed. Switch to 'Grid → corrected target (absolute)'.")
+        self._toast_timer.start(4500)
+
     # ------- UI updates -------
     @QtCore.pyqtSlot(dict)
     def on_status(self, data: dict):
@@ -1188,24 +1362,90 @@ class TrackerUI(QtWidgets.QWidget):
             self._toast_timer.start(2000)
             return
 
-        # live values
-        t = float(data.get("translation_error_mm", 0) or 0)
-        r = float(data.get("rotation_error_deg", 0) or 0)
-        s = float(data.get("score", 0) or 0)
-        vec = data.get("delta_vec_mm", [0.0, 0.0, 0.0])
+        mode = self.nav_mode.currentText()
 
-        self.card_trans.value.setText(f"{t:.2f}")
-        self.card_rot.value.setText(f"{r:.2f}")
-        self.card_score.value.setText(f"{s:.2f}")
+        # ---------------- Mode: Grid → target (relative) ----------------
+        if mode.startswith("Grid"):
+            t = float(data.get("translation_error_mm", 0) or 0)
+            r = float(data.get("rotation_error_deg", 0) or 0)
+            s = float(data.get("score", 0) or 0)
+            vec = data.get("delta_vec_mm", [0.0, 0.0, 0.0])
 
-        ok = bool(data.get("within_tol", False))
+            self.card_trans.value.setText(f"{t:.2f}")
+            self.card_rot.value.setText(f"{r:.2f}")
+            self.card_score.value.setText(f"{s:.2f}")
+
+            ok = bool(data.get("within_tol", False))
+            self.status_pill.setText("OK" if ok else "ADJUST")
+            self.status_pill.setStyleSheet(PILL_OK_STYLE if ok else PILL_ADJ_STYLE)
+
+            self.ind.set_translation_vec_mm(subject_to_view(vec))
+            self.ind.set_rotation_deg(r, signed=False)
+            return
+
+        # Absolute modes need absolute poses (emitted by tracker)
+        live = self._get_live_snapshot_like()
+
+        # ---------------- Mode: Participant → baseline (absolute) ----------------
+        if mode.startswith("Participant"):
+            if not self._participant_target_abs:
+                return
+            if live.get("subject_pos_mm") is None or live.get("subject_quat") is None:
+                return
+
+            p_live = np.asarray(live["subject_pos_mm"], float).reshape(3,)
+
+           
+            q_live = np.asarray(live["subject_quat"], float).reshape(4,)
+            p_tgt  = np.asarray(self._participant_target_abs["pos_m"], float).reshape(3,)
+            # Convert p target to be on same scale
+            p_tgt = [i*1000 for i in p_tgt]
+
+            q_tgt  = np.asarray(self._participant_target_abs["quat"], float).reshape(4,)
+
+            d_mm = (p_tgt - p_live) 
+            t = float(np.linalg.norm(d_mm))
+            r = float(tracker.rotation_geodesic_deg(tracker.rotmat_from_quat(q_live), tracker.rotmat_from_quat(q_tgt)))
+
+            ok = (t <= tracker.TRANS_TOL_MM) and (r <= tracker.ROT_TOL_DEG)
+            self.status_pill.setText("OK" if ok else "ADJUST")
+            self.status_pill.setStyleSheet(PILL_OK_STYLE if ok else PILL_ADJ_STYLE)
+
+            self.card_trans.value.setText(f"{t:.2f}")
+            self.card_rot.value.setText(f"{r:.2f}")
+            self.card_score.value.setText("—")
+
+            self.ind.set_translation_vec_mm(tuple(d_mm.tolist()))
+            self.ind.set_rotation_deg(r, signed=False)
+            return
+
+        # ---------------- Mode: Grid → corrected target (absolute) ----------------
+        if not self._grid_target_abs:
+            return
+        if live.get("grid_pos_mm") is None or live.get("grid_quat") is None:
+            return
+
+        p_live = np.asarray(live["grid_pos_mm"], float).reshape(3,)
+        print("p_live:", p_live)
+        q_live = np.asarray(live["grid_quat"], float).reshape(4,)
+        p_tgt  = np.asarray(self._grid_target_abs["pos_m"], float).reshape(3,)
+        print(p_tgt)
+        R_tgt  = np.asarray(self._grid_target_abs["R"], float).reshape(3,3)
+        R_live = tracker.rotmat_from_quat(q_live)
+
+        d_mm = (p_tgt - p_live) # here is the correction happening
+        t = float(np.linalg.norm(d_mm))
+        r = float(tracker.rotation_geodesic_deg(R_live, R_tgt))
+
+        ok = (t <= tracker.TRANS_TOL_MM) and (r <= tracker.ROT_TOL_DEG)
         self.status_pill.setText("OK" if ok else "ADJUST")
         self.status_pill.setStyleSheet(PILL_OK_STYLE if ok else PILL_ADJ_STYLE)
 
-        # Update visuals:
-        # 1) Translation+tilt cone (use your Subject→View mapping)
-        self.ind.set_translation_vec_mm(subject_to_view(vec))
-        # 2) Rotation dial (currently magnitude only)
+        self.card_trans.value.setText(f"{t:.2f}")
+        self.card_rot.value.setText(f"{r:.2f}")
+        self.card_score.value.setText("—")
+
+        self.ind.set_translation_vec_mm(tuple(d_mm.tolist()))
         self.ind.set_rotation_deg(r, signed=False)
     
     def _safe_thread_running(self):
@@ -1222,28 +1462,39 @@ class TrackerUI(QtWidgets.QWidget):
 
     # Absolute error dialog helper
     def _get_live_snapshot_like(self) -> dict:
+        """
+        Convert current live status (self._last_status) into the same dict schema
+        as the saved snapshot JSON, so we can compare apples-to-apples.
+        """
         if not self._last_status:
             raise ValueError("No live status yet. Start tracker first.")
         d = self._last_status
 
-        # Must exist now because we added them to tracker live emit
         return {
             "ts": datetime.now().isoformat(timespec="seconds"),
+            "delta_vec_mm": d.get("delta_vec_mm", [0.0, 0.0, 0.0]),
+            "translation_error_mm": float(d.get("translation_error_mm", 0.0) or 0.0),
+            "rotation_error_deg": float(d.get("rotation_error_deg", 0.0) or 0.0),
+            "score": float(d.get("score", 0.0) or 0.0),
+            "within_tol": bool(d.get("within_tol", False)),
+
+            # Absolute poses (meters). Emitted by tracker.py.
             "grid_pos_mm": d.get("grid_pos_mm"),
-            "subject_pos_mm": d.get("subject_pos_mm"),
             "grid_quat": d.get("grid_quat"),
+            "subject_pos_mm": d.get("subject_pos_mm"),
             "subject_quat": d.get("subject_quat"),
+            "grid_pos_mm": d.get("grid_pos_mm"),
+            "grid_quat": d.get("grid_quat"),
         }
 
-
     def open_abs_error_dialog(self):
-        # if not self._saved_history:
-        #     QtWidgets.QMessageBox.information(
-        #         self,
-        #         "No snapshots yet",
-        #         "Save at least one snapshot first (then you can compare snapshot↔snapshot or live↔snapshot).",
-        #     )
-        #     return
+        if not self._saved_history:
+            QtWidgets.QMessageBox.information(
+                self,
+                "No snapshots yet",
+                "Save at least one snapshot first (then you can compare snapshot↔snapshot or live↔snapshot).",
+            )
+            return
 
         dlg = AbsErrorDialog(self, history=self._saved_history, get_live_dict_callable=self._get_live_snapshot_like)
         dlg.exec_()
