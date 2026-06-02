@@ -95,9 +95,13 @@ def relative_RT_with_points(R_s, p_s, p_s_local, R_g, p_g, p_g_local):
     return R_rel, t_rel
 
 def rotation_geodesic_deg(R_a, R_b):
-    dR = R_a.T @ R_b
-    tr = np.clip((np.trace(dR) - 1) / 2.0, -1.0, 1.0)
-    return math.degrees(math.acos(tr))
+    """
+    Computes the rotation error between timepoint a and b.
+    """
+    
+    dR = R_a.T @ R_b # inverse of roation a followed by rotation b
+    tr = np.clip((np.trace(dR) - 1) / 2.0, -1.0, 1.0) #np.trace takes diagonal sum -> linked to angle 
+    return math.degrees(math.acos(tr)) # convert back to angle 
 
 # ---------- NatNet state ----------
 id2name: Dict[int, str] = {}
